@@ -1,0 +1,5 @@
+# 仓库里全是 LF（Markdown / JS / JSON / YAML 都不该因为操作系统改行尾）
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary

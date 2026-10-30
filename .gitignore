@@ -1,0 +1,14 @@
+# 本机调试残留：.inspect-out.log 里带 dsh web 的一次性 token，绝不入库
+.inspect-*.log
+*.log
+
+# 依赖与构建产物
+node_modules/
+pnpm-debug.log*
+*.tsbuildinfo
+
+# 编辑器 / 操作系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

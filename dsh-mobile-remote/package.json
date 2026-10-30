@@ -1,0 +1,34 @@
+{
+  "name": "dsh-mobile-remote",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "手机扫码远程控制 DSH 桌面客户端：局域网 / 公网隧道双模，二维码一键连接（浏览器或微信）",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": "./lib/host.js",
+    "./client": "./lib/client.js",
+    "./qr": "./lib/qr.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection"
+      ],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "test": "node --test test/qr.test.mjs test/proxy.test.mjs test/host-plugin.test.mjs test/public-ready.test.mjs test/client-bundle.test.mjs",
+    "verify": "node tools/verify-plugin.mjs",
+    "e2e:lan": "node tools/e2e-lan.mjs"
+  }
+}
