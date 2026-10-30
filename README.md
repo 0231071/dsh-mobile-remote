@@ -5,8 +5,9 @@
 
 <p>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <a href="https://github.com/0231071/dsh-mobile-remote/actions/workflows/test.yml"><img alt="test" src="https://github.com/0231071/dsh-mobile-remote/actions/workflows/test.yml/badge.svg"></a>
   <img alt="runtime deps" src="https://img.shields.io/badge/runtime%20deps-0-brightgreen.svg">
-  <img alt="tests" src="https://img.shields.io/badge/tests-42%20passing-brightgreen.svg">
+  <img alt="tests" src="https://img.shields.io/badge/tests-42-brightgreen.svg">
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20-339933.svg">
   <img alt="dsh" src="https://img.shields.io/badge/DSH-bundle%20plugin-4d6bfe.svg">
 </p>
