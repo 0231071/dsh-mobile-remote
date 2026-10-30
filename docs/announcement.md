@@ -10,9 +10,10 @@
 >   1. `[Plugin] DSH Mobile Remote —— 手机扫码控制电脑上的 DSH｜Control your desktop DSH from your phone with one QR scan`
 >   2. `[Plugin] DSH Mobile Remote：不改绑定地址，让手机扫码用上同一个 DSH`
 >   3. `DSH Mobile Remote —— 局域网 / 公网双模的手机遥控（附 5 个真实缺陷的排查日志）`
-> - **配图**（强烈建议，能显著提高点击率）：在正文里那两个 `<!-- 截图位 -->` 处各拖一张图进去 ——
->   ① 桌面端「设置 → 手机连接」；② 手机上打开后的样子。GitHub 会自动上传成 user-attachments 链接。
-> - **Discord 短版**：文末有 3 行版本（`https://discord.gg/4MrtZUhpxg`）。
+> - **配图**（强烈建议，能显著提高点击率）：正文里有两处醒目的**配图占位行**，
+>   各拖一张图进去替换掉那行 —— ① 桌面端「设置 → 手机连接」；② 手机上打开后的样子。
+>   GitHub 会自动上传成 user-attachments 链接。
+> - **短消息版**：见文末，可直接贴到 Discord（`https://discord.gg/4MrtZUhpxg`）。
 > - 正文在下面的分隔线之后；**英文与中文两版各自完整**，读者只读一版也不会缺信息。
 
 ---
@@ -23,9 +24,11 @@ Hi all 👋
 
 I built a plugin that lets you drive your **desktop** DSH from your **phone**: the desktop shows a QR code, your phone scans it (system camera or WeChat) and lands in *the exact same* web UI — same process, same sessions, same task queue, same tools.
 
+Concretely: kick off a long task at your desk, walk away, and keep steering **the same session** from your phone — no second instance, no second login, no state to sync.
+
 **Repo:** https://github.com/0231071/dsh-mobile-remote · MIT · tagged [`dsh-plugin`](https://github.com/topics/dsh-plugin)
 
-<!-- 截图位 ①：桌面端「设置 → 手机连接」 -->
+> 📷 **配图 ①：换成桌面端「设置 → 手机连接」的截图 / replace with a desktop-side screenshot, then continue.**
 
 ### Two transports
 
@@ -34,7 +37,7 @@ I built a plugin that lets you drive your **desktop** DSH from your **phone**: t
 | **LAN** | `http://<lan-ip>:<port>/?token=…` | phone on the same Wi-Fi — traffic never leaves your network |
 | **Public** | `https://<random>.trycloudflare.com/?token=…` | phone on 4G/5G, anywhere — `cloudflared` quick tunnel, no port forwarding, no VPS |
 
-<!-- 截图位 ②：手机上打开的 DSH -->
+> 📷 **配图 ②：换成手机上打开的样子 / replace with a phone screenshot, then continue.**
 
 ### The design decision that matters: DSH is *not* bound to `0.0.0.0`
 
@@ -102,9 +105,12 @@ Thanks for the "everything is a plugin" architecture — this was the first bund
 我做的是一个让**手机遥控桌面 DSH** 的插件：桌面端点一下出二维码，手机用系统相机或**微信**扫一扫，
 就进入**同一个** DSH Web UI —— 同一进程、同一会话、同一任务队列，模型和工具全都能用。
 
+具体一点：在电脑上起一个长任务，起身走开，然后在手机上接着指挥**同一个会话** ——
+不需要第二个实例、不需要二次登录、不需要同步任何状态。
+
 **仓库：** https://github.com/0231071/dsh-mobile-remote · MIT · 已带 [`dsh-plugin`](https://github.com/topics/dsh-plugin) topic
 
-<!-- 截图位 ①：桌面端「设置 → 手机连接」 -->
+> 📷 **配图 ①：换成桌面端「设置 → 手机连接」的截图 / replace with a desktop-side screenshot, then continue.**
 
 ### 两种接入
 
@@ -113,7 +119,7 @@ Thanks for the "everything is a plugin" architecture — this was the first bund
 | **局域网** | `http://<局域网IP>:<端口>/?token=…` | 手机和电脑同一 Wi-Fi，流量不出本网段 |
 | **公网** | `https://<随机>.trycloudflare.com/?token=…` | 手机在 4G/5G、异地 —— cloudflared 快速隧道，不用端口映射、不用服务器 |
 
-<!-- 截图位 ②：手机上打开的 DSH -->
+> 📷 **配图 ②：换成手机上打开的样子 / replace with a phone screenshot, then continue.**
 
 ### 关键设计：**没有**把 DSH 绑到 `0.0.0.0`
 
@@ -173,7 +179,7 @@ git clone https://github.com/0231071/dsh-mobile-remote.git
 
 ---
 
-## Discord 短版（三行）
+## 短消息版（直接贴 Discord）
 
 ```
 DSH Mobile Remote — control your desktop DSH from your phone. Desktop shows a QR code, phone scans it
