@@ -241,6 +241,35 @@ async function main() {
     check('手机带 cookie 打开首页 → 200', phoneHome.status === 200, `HTTP ${phoneHome.status}`);
     check('手机首页是 DSH 前端', phoneHome.body.includes('__DSH_BOOT__'), '首页不含启动清单');
 
+    // ⑦b 自愈链路（对**真实 DSH** 验，不能只靠假源站）
+    //     ① 认证成功那一刻，代理必须补发恢复票；
+    //     ② 带恢复票换票 → 302 回入口地址（手机不用第二次扫码）；
+    //     ③ 没票只能拿到中转页，且不泄露入口地址；
+    //     ④ 未认证的**文档**经代理 → 401 已换成中转页（真实那句原文必须被替换掉）。
+    const cookies = phoneFirst.headers['set-cookie'] ?? [];
+    const bootHeader = cookies.find((c) => c.startsWith('dsh-mobile-boot='));
+    check('手机首跳同时拿到恢复票（dsh-mobile-boot）', Boolean(bootHeader), `Set-Cookie=${JSON.stringify(cookies)}`);
+    if (bootHeader) {
+      const bootCookie = bootHeader.split(';')[0];
+      const redeem = await request(port, '/mobile-remote/redeem', { headers: { cookie: bootCookie }, host });
+      check('恢复票换票 → 302 回入口地址',
+        redeem.status === 302 && redeem.headers.location === lanState.authUrl,
+        `HTTP ${redeem.status} location=${redeem.headers.location}`);
+    }
+    const noTicket = await request(port, '/mobile-remote/redeem', { host });
+    check('无恢复票 → 只给中转页且不泄露入口地址',
+      noTicket.status === 200 && noTicket.body.includes('/mobile-remote/redeem') && !noTicket.body.includes('token='),
+      `HTTP ${noTicket.status}`);
+    const relayDoc = await request(Number(lanState.proxyPort), '/', {
+      host: phoneAuthority,
+      headers: { accept: 'text/html', 'sec-fetch-dest': 'document' },
+    });
+    check('未认证文档经代理 → 401 但已是中转页',
+      relayDoc.status === 401
+        && relayDoc.body.includes('/mobile-remote/redeem')
+        && !relayDoc.body.includes('dsh web authentication required'),
+      `HTTP ${relayDoc.status}，正文前 80 字：${JSON.stringify(relayDoc.body.slice(0, 80))}`);
+
     // ⑧ 关闭：端口释放
     const disable = await request(port, '/mobile-remote/disable', { method: 'POST', headers: { cookie }, host });
     check('disable 返回 200', disable.status === 200, `HTTP ${disable.status}`);

@@ -469,8 +469,8 @@ window.__ModuleLoader__.load({
             ]),
             h('div', { key: 'tip', style: { fontSize: 12, color: C.muted, lineHeight: '18px' } },
               state.mode === 'public'
-                ? '链接含一次性登录令牌，等于本机 DSH 的钥匙：请勿转发给他人，用完点「关闭手机连接」。'
-                : '手机需与电脑在同一 Wi-Fi；链接含一次性登录令牌，请勿分享。'),
+                ? '链接含登录令牌，等于本机 DSH 的钥匙：请勿转发给他人，用完点「关闭手机连接」。'
+                : '手机需与电脑在同一 Wi-Fi；链接含登录令牌，请勿分享。'),
           ]),
         ]));
       }
@@ -489,8 +489,9 @@ window.__ModuleLoader__.load({
       }, [
         h('div', { key: 't', style: { color: C.text, fontWeight: 600, marginBottom: 4 } }, '说明'),
         h('div', { key: 'a' }, '· DSH 自身始终只监听 127.0.0.1，本功能通过本机改写代理对外开放，不会修改 dsh web 的绑定地址。'),
-        h('div', { key: 'b' }, '· 手机首次扫码由 DSH 校验令牌并下发会话 cookie，之后凭 cookie 访问；代理不接触鉴权。'),
+        h('div', { key: 'b' }, '· 手机首次扫码由 DSH 校验令牌并下发会话 cookie，之后凭 cookie 访问；代理不接触 DSH 的鉴权判断。'),
         h('div', { key: 'c' }, '· 公网模式依赖 cloudflared 快速隧道（首次会自动下载）；微信内置浏览器可直接打开该链接。'),
+        h('div', { key: 'd' }, '· 手机端登录票失效时（微信回收网页、清缓存、从聊天再次打开都会这样），会显示「重新认证」页：点一下即可恢复，不用扫第二次码。'),
       ]));
 
       return h('div', {

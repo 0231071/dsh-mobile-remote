@@ -13,6 +13,7 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { decodeMatrix } from './qr-decode.mjs';
@@ -29,13 +30,13 @@ const { apply, inject, name } = await import('../lib/host.js');
 after(() => fs.rmSync(traceDir, { recursive: true, force: true }));
 
 /** 造一个最小宿主 ctx：只提供 host.js 真正用到的面。 */
-function makeCtx({ logger } = {}) {
+function makeCtx({ logger, webServerPort = 45678 } = {}) {
   const routes = [];
   const registered = [];
   const ctx = {
     logger: logger === undefined ? { info: () => {}, warn: () => {} } : logger,
     webServer: {
-      port: 45678,
+      port: webServerPort,
       register(route) {
         if (routes.some((r) => r.path === route.path)) throw new Error(`duplicate route ${route.path}`);
         routes.push(route);
@@ -269,3 +270,125 @@ test('卸载：清理必须交回 promise，且 await 之后端口已释放', as
   });
   assert.equal(occupied, false, 'await 清理之后代理端口应已释放');
 });
+
+//#region 自愈：中转页 + 恢复票换票
+
+/** 像手机一样经代理发一个请求，返回状态、响应头与全部 Set-Cookie。 */
+function requestVia(port, requestPath, { accept, host } = {}) {
+  return new Promise((resolve, reject) => {
+    const headers = {};
+    if (accept) headers.accept = accept;
+    if (host) headers.host = host;
+    const req = http.request({ host: '127.0.0.1', port, path: requestPath, headers }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => resolve({
+        status: res.statusCode,
+        setCookie: res.headers['set-cookie'] ?? [],
+        body: Buffer.concat(chunks).toString('utf8'),
+      }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+/** 等状态机跑到 on（局域网模式很快）。 */
+async function waitForOn(routes) {
+  let state = null;
+  for (let i = 0; i < 40; i++) {
+    state = JSON.parse((await hit(routes, '/mobile-remote/status')).body);
+    if (state.phase === 'on' || state.phase === 'error') break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return state;
+}
+
+test('自愈：中转页与换票入口在未认证时仍可达（否则就是「401 页要你先认证」）', async () => {
+  const { ctx, routes } = makeCtx();
+  // 手机没有 DSH cookie 时，宿主给的真实判定就是 401
+  ctx.connection.requestRejection = () => 401;
+  apply(ctx);
+
+  const page = await hit(routes, '/mobile-remote/relay');
+  assert.equal(page.status, 200, '中转页必须未认证可达');
+  assert.match(page.headers['content-type'], /text\/html/);
+  assert.match(page.body, /重新认证/);
+  assert.match(page.body, /\/mobile-remote\/redeem/, '按钮必须指向换票入口');
+  assert.equal(page.headers['cache-control'], 'no-store');
+
+  const denied = await hit(routes, '/mobile-remote/redeem');
+  assert.equal(denied.status, 200, '没有恢复票时也要给人看的页面');
+  assert.match(denied.body, /恢复票/, '要说清「恢复票也不在了」，而不是白屏或 401');
+  assert.ok(!denied.body.includes('href="/mobile-remote/redeem"'),
+    '已知换不出票时不能再摆一个「不用再扫码」的按钮（点了只会回到同一页）');
+
+  // 自愈入口没有把鉴权撕开口子：真正的状态接口对未认证请求仍然 401
+  const status = await hit(routes, '/mobile-remote/status');
+  assert.equal(status.status, 401, '状态接口仍必须受 cookie 保护');
+});
+
+test('自愈：扫码换票时补发恢复票，redeem 凭票 302 回入口地址（不用二次扫码）', async () => {
+  // 一个「行为与 DSH 一致」的假源站：token → 303 + dsh-auth-*；带票 → 200；否则官方 401 文本
+  const origin = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://placeholder');
+    if (url.searchParams.get('token') === 'TESTTOKEN') {
+      res.writeHead(303, {
+        location: './',
+        'set-cookie': 'dsh-auth-ZZZ=1; Path=/; HttpOnly; SameSite=Strict',
+      });
+      res.end();
+      return;
+    }
+    if ((req.headers.cookie ?? '').includes('dsh-auth-ZZZ')) {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end('<html>ok</html>');
+      return;
+    }
+    res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('dsh web authentication required; reopen the URL printed by dsh web.\n');
+  });
+  await new Promise((resolve) => origin.listen(0, '127.0.0.1', resolve));
+
+  const { ctx, routes } = makeCtx({ webServerPort: origin.address().port });
+  apply(ctx);
+
+  try {
+    await hit(routes, '/mobile-remote/enable', { method: 'POST', body: { mode: 'lan' } });
+    const state = await waitForOn(routes);
+    assert.equal(state?.phase, 'on', `前置条件：局域网模式应已开启，实际 ${state?.phase}（${state?.lastError ?? state?.message}）`);
+
+    // ① 像手机一样经代理扫码：DSH 的票 + 插件的恢复票都要到手
+    const first = await requestVia(state.proxyPort, '/?token=TESTTOKEN', { accept: 'text/html' });
+    assert.equal(first.status, 303, '令牌首跳应为 303');
+    const bootHeader = first.setCookie.find((c) => c.startsWith('dsh-mobile-boot='));
+    assert.ok(bootHeader, `应补发一张恢复票，实际：${JSON.stringify(first.setCookie)}`);
+    const bootValue = /^dsh-mobile-boot=([^;]+)/.exec(bootHeader)[1];
+
+    // ② 带恢复票换票 → 302 到入口地址（含 token）
+    const redeemed = await hit(routes, '/mobile-remote/redeem', { headers: { cookie: `dsh-mobile-boot=${bootValue}` } });
+    assert.equal(redeemed.status, 302, `应 302 到入口地址，实际 ${redeemed.status}`);
+    assert.equal(redeemed.headers.location, state.authUrl);
+    assert.match(redeemed.headers.location, /token=TESTTOKEN/);
+    assert.equal(redeemed.headers['cache-control'], 'no-store');
+    assert.equal(redeemed.headers['referrer-policy'], 'no-referrer');
+
+    // ③ 伪造的票：只给中转页，绝不泄露任何地址
+    const forged = await hit(routes, '/mobile-remote/redeem', { headers: { cookie: 'dsh-mobile-boot=guess' } });
+    assert.equal(forged.status, 200);
+    assert.equal(forged.headers.location, undefined, '错票不得 302');
+    assert.ok(!forged.body.includes('TESTTOKEN'), '错票不得换出地址');
+
+    // ④ 关闭连接 → 恢复票立即作废
+    await hit(routes, '/mobile-remote/disable', { method: 'POST' });
+    const afterClose = await hit(routes, '/mobile-remote/redeem', { headers: { cookie: `dsh-mobile-boot=${bootValue}` } });
+    assert.equal(afterClose.status, 200);
+    assert.equal(afterClose.headers.location, undefined, '关掉之后旧票不得再换票');
+    assert.ok(!afterClose.body.includes('TESTTOKEN'));
+    assert.match(afterClose.body, /没在运行/);
+  } finally {
+    await new Promise((resolve) => origin.close(resolve));
+  }
+});
+
+//#endregion

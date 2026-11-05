@@ -27,6 +27,12 @@ import { join } from 'node:path';
 import { listLanIPv4 } from './net.js';
 import { RewriteProxy } from './proxy.js';
 import { qrPngDataUrl } from './qr.js';
+import {
+  RELAY_PATH,
+  mintBootSecret,
+  relayPageHtml,
+  requestHasBootTicket,
+} from './recover.js';
 import { ensureCloudflared, startQuickTunnel, waitForPublicReady } from './tunnel.js';
 
 /**
@@ -198,6 +204,8 @@ export function apply(ctx) {
     provider: null,
     /** PNG data URL */
     qrPng: null,
+    /** 登录票失效时的重新认证入口（手机端 401 中转页的按钮也指向它） */
+    recoverPath: RELAY_PATH,
     message: '未开启',
     lastError: null,
     updatedAt: Date.now(),
@@ -205,6 +213,14 @@ export function apply(ctx) {
 
   let proxy = null;
   let tunnel = null;
+  /**
+   * 引导票（详见 lib/recover.js）：
+   * - **每次开启连接重新生成**，关闭/切换/卸载即作废 —— 与二维码同寿命；
+   * - 只往 `state` 里放「有没有」，密钥本身绝不进 JSON、不进日志、不出现在任何响应体里，
+   *   它只以 HttpOnly cookie 的形式回到那台手机的浏览器里。
+   * @type {{ secret: string } | null}
+   */
+  let bootTicket = null;
   /** 串行化 enable/disable，避免并发点按把代理和隧道搅乱。 */
   let queue = Promise.resolve();
   /**
@@ -239,6 +255,8 @@ export function apply(ctx) {
       await proxy.stop();
       proxy = null;
     }
+    // 恢复票随连接一起作废：不留任何「关掉还能换票」的窗口。
+    bootTicket = null;
     state.phase = 'off';
     state.enabled = false;
     state.qrPng = null;
@@ -265,7 +283,10 @@ export function apply(ctx) {
     state.message = mode === 'public' ? '正在建立公网隧道…' : '正在启动局域网代理…';
     touch();
 
-    const instance = new RewriteProxy({ targetPort, log });
+    // 每次开启连接都换一张新的恢复票：它与二维码同寿命，关闭/切换即作废。
+    bootTicket = { secret: mintBootSecret() };
+    trace('boot ticket minted for this session');
+    const instance = new RewriteProxy({ targetPort, log, boot: bootTicket });
     try {
       await instance.start({ port: Number.isInteger(port) && port > 0 ? port : 0 });
     } catch (error) {
@@ -333,11 +354,13 @@ export function apply(ctx) {
         const selected = ip && ips.includes(ip) ? ip : ips[0];
         state.selectedIp = selected;
         base = `http://${selected}:${instance.port}`;
-        state.message = '手机需与电脑在同一 Wi-Fi 下扫码；链接含一次性登录令牌，请勿分享。';
+        state.message = '手机需与电脑在同一 Wi-Fi 下扫码；链接含登录令牌，请勿分享。';
       }
 
       // 用官方 Connection 生成带 token 的入口地址：token 由 DSH 自己校验并下发
-      // 会话 cookie，本插件不参与鉴权，也不保存任何密钥。
+      // 会话 cookie，业务鉴权始终在 DSH 里。插件唯一持有的秘密是**自己签发的恢复票**
+      // （上面 mintBootSecret()，仅用于在 DSH cookie 失效后重新换一次票），
+      // 它不参与 DSH 的鉴权判断，也无法伪造 DSH 的会话 cookie。
       const authUrl = ctx.connection.authenticatedUrl(`${base}/`);
       state.baseUrl = base;
       state.authUrl = authUrl;
@@ -366,13 +389,84 @@ export function apply(ctx) {
     return true;
   }
 
+  /**
+   * 发「重新认证」中转页。
+   *
+   * 这页**必须未认证可达**：它出现的时刻，正是手机没有（或没带）DSH cookie 的时刻；
+   * 若也走 `requestRejection`，就变成「401 页要求你先认证」，死循环。
+   * 页面本身是纯静态文案 + 一个同源链接，不含 token、不含内部状态，外泄无害。
+   *
+   * @param {import('node:http').ServerResponse} response
+   * @param {{ note?: string, redeemable?: boolean }} [options] 传了 `note` 就说明
+   *   「换票已知不可能」（没票 / 连接没在运行），此时页面不再给按钮 ——
+   *   一个点了必然回到原页的按钮比没有按钮更糟。
+   */
+  function sendRelayPage(response, options = {}) {
+    const body = Buffer.from(relayPageHtml(options), 'utf8');
+    response.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'content-length': body.byteLength,
+      'cache-control': 'no-store',
+      'referrer-policy': 'no-referrer',
+      'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'",
+    });
+    response.end(body);
+  }
+
+  /**
+   * 换票：拿着有效的恢复票，换回一条带 token 的入口地址。
+   *
+   * 为什么能省掉第二次扫码：DSH 的 token 是**进程级常量**（不是一次性的），
+   * 所以 `ctx.connection.authenticatedUrl()` 随时可以再拼一次，由 DSH 自己 303 + 下发 cookie。
+   * 前提是「这台手机确实曾经过认证」——这就是恢复票的作用。
+   *
+   * @param {import('node:http').IncomingMessage} request
+   * @param {import('node:http').ServerResponse} response
+   */
+  function redeem(request, response) {
+    if (state.phase !== 'on' || typeof state.authUrl !== 'string' || bootTicket === null) {
+      sendRelayPage(response, {
+        note: `手机连接现在没在运行（${state.message}）。请到桌面端「设置 → 手机连接」重新开启并扫码。`,
+        redeemable: false,
+      });
+      return;
+    }
+    if (!requestHasBootTicket(request.headers.cookie, bootTicket.secret)) {
+      sendRelayPage(response, {
+        note: '这台手机上的「恢复票」也不在了（微信清过缓存、换过浏览器，或连接重开过），只能重新扫一次桌面端的二维码。',
+        redeemable: false,
+      });
+      return;
+    }
+    // 只把带 token 的地址交给持票者；不写日志、不回显，避免 token 进日志/截屏。
+    response.writeHead(302, {
+      location: state.authUrl,
+      'cache-control': 'no-store',
+      'referrer-policy': 'no-referrer',
+    });
+    response.end();
+    log('恢复票校验通过：已重新下发入口地址（手机端无需扫码）');
+  }
+
   const route = {
     kind: 'prefix',
     path: ROUTE_PREFIX,
     handler: async (request, response) => {
-      if (rejected(request, response)) return;
       const url = new URL(request.url ?? '/', 'http://dsh.invalid');
       const action = url.pathname.slice(ROUTE_PREFIX.length).replace(/^\/+|\/+$/g, '');
+
+      // ⚠️ 顺序是有意的：自愈入口排在 cookie 校验之前。
+      // 它们派上用场的时刻，恰恰是「手机没有 DSH cookie」的时刻。
+      if (request.method === 'GET' && action === 'relay') {
+        sendRelayPage(response);
+        return;
+      }
+      if (request.method === 'GET' && action === 'redeem') {
+        redeem(request, response);
+        return;
+      }
+
+      if (rejected(request, response)) return;
 
       try {
         if (request.method === 'GET' && action === 'status') {

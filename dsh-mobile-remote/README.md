@@ -27,7 +27,7 @@ error: --host 0.0.0.0 is intentionally not supported yet for safety:
 1. DSH 依旧只听 `127.0.0.1`；
 2. 本插件在 `0.0.0.0` 上另开一个**头部改写反向代理**，流量转给回环上的 DSH；
 3. 代理在转发时把 `Host` / `Origin` / `Referer` 改写成回环 authority —— 这是让 DSH 的信任判定与「authority 绑定 cookie」正常工作的关键；
-4. 鉴权完全交给 DSH 自己：二维码里带的是官方一次性 token，首次访问由 DSH 校验并下发会话 cookie，插件不接触、不保存任何密钥。
+4. 鉴权完全交给 DSH 自己：二维码里带的是官方**进程级登录令牌**（不是一次性的 —— 进程没重启就一直有效，重启才换），首次访问由 DSH 校验并下发会话 cookie。插件不参与 DSH 的鉴权判断；它自己只持有一张**恢复票**（见 §5.1），用于在 DSH 的 cookie 失效后重新换一次票。
 
 ---
 
@@ -69,6 +69,8 @@ git clone https://github.com/0231071/dsh-mobile-remote.git
 4. 手机扫码 → 直接进入 DSH Web UI；
 5. 用完点 **关闭手机连接**：代理端口释放、隧道进程回收、二维码清空。
 
+**用一段时间后手机提示「需要重新认证」**：不用重新扫码 —— 页面上点「重新认证」即可（原因与边界见 §5）。
+
 **运行中切换模式**：正在用局域网时想换公网，直接点「公网」页签即可 —— 主按钮会立刻变成
 **「切换到公网并重新开启」**，点一下就会停掉旧会话、起隧道、出新二维码，不需要先手动关闭。
 （早期版本里点页签没有任何反馈，界面仍显示局域网，看起来像页签坏了。）
@@ -93,6 +95,8 @@ git clone https://github.com/0231071/dsh-mobile-remote.git
  │  · Host → 127.0.0.1:<DSH端口>  │
  │  · Origin / Referer 同步改写    │
  │  · 双向全双工（SSE / WebSocket）│
+ │  · 认证成功时补发「恢复票」      │
+ │  · 文档 401 → 重新认证中转页    │
  └──────────────┬───────────────┘
                 ▼
  ┌──────────────────────────────┐
@@ -109,19 +113,68 @@ git clone https://github.com/0231071/dsh-mobile-remote.git
 
 插件自己的 HTTP 路由（`/mobile-remote/status|enable|disable`）与官方 `/api` 走**同一套**信任判定（`connection.requestRejection`）：未带有效 cookie 一律 401。
 
+**两个例外**：`/mobile-remote/relay`（中转页）与 `/mobile-remote/redeem`（换票入口）**刻意不挂**这道判定 —— 它们派上用场的时刻，正是手机没有 DSH cookie 的时刻；若也拦，就变成「401 页面要求你先认证」的死循环。这两条路径的安全边界由「恢复票」自己承担（见 §5.1），且都不回显任何内部状态。
+
 ---
 
-## 5. 安全说明
+## 5. 手机端登录票失效了怎么办
+
+### 5.1 为什么会失效（这不是插件的 bug，是 DSH 的鉴权形态决定的）
+
+DSH 的浏览器鉴权只有两张票：
+
+1. **进程级登录令牌**：`BrowserAuth.launchToken`，只从 URL 进来（`GET /?token=…` → `303 Location: ./` + `Set-Cookie`）。303 之后地址栏里就没有它了。
+2. **签名 cookie**：名字是 `dsh-auth-<sha256(authority)>`，值里绑死 `authority`（也就是代理改写后的回环 `127.0.0.1:<端口>`），属性 `HttpOnly; SameSite=Strict`，绝对有效期 30 天。
+
+于是只要那张 cookie **不在**或**没被发送**，DSH 对文档请求就只回一行纯文本：
+
+```
+dsh web authentication required; reopen the URL printed by dsh web.
+```
+
+（这句来自 `BrowserAuth.writeUnauthorized`；注意只有 **HTML 文档**和 `/connect` 走这个判定，JS/CSS 等静态资源不需要 cookie —— 所以现场表现是「整页变成这行字」，而不是白屏或转圈。）
+
+手机端最常见的两个触发点，都不在 DSH 侧：
+
+- **微信内置浏览器回收网页**：切后台久了 WebView 被系统/微信回收，回来时重载的是**已去掉 token 的地址**，cookie 若已不在就直接 401；
+- **`SameSite=Strict` 跨站入口不发 cookie**：从聊天链接、收藏、浮窗、「最近使用」再次打开那种地址（已无 token），浏览器判定为跨站顶层导航，**不发** Strict cookie → 401。
+
+还有一种服务端成因值得知道：DSH 的校验里有 `payload.issuedAt > now` 这一条，**电脑时钟被往回拨**（睡眠唤醒 / NTP 校时）会让已签发的 cookie 全部判无效，同样只能换新票。
+
+### 5.2 现在的自愈路径（不必二次扫码）
+
+- 代理在**DSH 刚认证成功的那一刻**（302/303 + 它自己的 `dsh-auth-*` cookie）顺手给这台手机补一张 `dsh-mobile-boot`（**恢复票**，`HttpOnly; SameSite=Lax`，无 `Secure`）。
+  只对「DSH 已经认证过」的响应注入，**未认证访客永远拿不到** —— 否则等于把钥匙发给任何能打开隧道的人。
+- 文档被 401 掉时，代理把这个响应换成**重新认证中转页**（状态仍是 401，把话说清楚 + 一个按钮），手机上不再只剩一行纯文本。
+- 按钮打到 `/mobile-remote/redeem`：恢复票有效 → `302` 到 `ctx.connection.authenticatedUrl(...)`（那条带 token 的入口地址），由 **DSH 自己**重新下发会话 cookie，回到界面。
+- 恢复票也没了（微信清了缓存、换了浏览器）→ 中转页直接告诉你「只能重新扫一次码」，并列出步骤；**这时不会给你一个点了必然失败的按钮** —— 一个「点了又回到同一页」的循环比没有按钮更糟。
+
+因为用的是 `SameSite=Lax`，**上面那个「Strict 不发 cookie」的场景正好被覆盖**：跨站入口进来时 Strict cookie 缺席、恢复票在场，点一下即可恢复。
+
+> 为什么要 `Lax` 而不是 `Strict`：要救的正是「Strict 不发」的场景。Lax 只在**顶层 GET 导航**时发送，脚本也读不到（HttpOnly），跨站子请求拿不到它。
+
+### 5.3 恢复票的权限边界（必须说清楚）
+
+恢复票能换出 DSH 的会话 cookie，**所以它本身就是钥匙**，与二维码里的链接同一档权限。它不比现有模型多给任何一类权限（拿到会话 cookie 的人本来就能操作这台机器），只是让「同一个浏览器」在 DSH cookie 失效后还能自己换一次票。因此：
+
+- **每次开启连接重新生成**，关闭 / 切换模式 / 重启 DSH 即作废；
+- 只以 HttpOnly cookie 形式回到那台手机的浏览器里，**不进 JSON、不进日志、不回显**；
+- 中转页是**未认证可达**的静态页：不含 token、不含内部状态，外泄无害。
+
+---
+
+## 6. 安全说明
 
 - DSH 永远只监听 `127.0.0.1`，本插件不改变这一点。
-- 二维码里的链接 = **本机 DSH 的钥匙**（含一次性 token）。别截图发群、别贴到聊天窗口。
+- 二维码里的链接 = **本机 DSH 的钥匙**（含进程级登录令牌）。别截图发群、别贴到聊天窗口。
 - 公网模式给出的是**免登录临时域名**，任何拿到链接的人都能操作你的电脑：不用时立刻点「关闭手机连接」。
-- cookie 属性为 `HttpOnly; SameSite=Strict`，**不带 `Secure`** —— 这是官方行为，也是局域网 http 可以登录的原因。
+- DSH 自己的会话 cookie 属性为 `HttpOnly; SameSite=Strict`，**不带 `Secure`** —— 这是官方行为，也是局域网 http 可以登录的原因。
+- 恢复票（`dsh-mobile-boot`）是本插件唯一的长期凭据，`HttpOnly; SameSite=Lax`，同样不带 `Secure`（否则局域网 http 下存不下来）；权限边界见 §5.3。
 - 公网隧道是 Cloudflare 的 quick tunnel，出入口都在 Cloudflare；链路之外没有额外中间人。
 
 ---
 
-## 6. 排查
+## 7. 排查
 
 | 现象 | 原因与处理 |
 |---|---|
@@ -133,23 +186,34 @@ git clone https://github.com/0231071/dsh-mobile-remote.git
 | 手机扫不开、电脑能开 | 局域网模式多为防火墙拦了代理端口，或手机不在同一网段（访客 Wi-Fi / AP 隔离）。先在电脑上放行该端口或改用公网模式。 |
 | 公网模式最终提示「探针未通过」 | 说明本机解析不到该临时子域（部分公司网络/出口 DNS 不解析动态记录）。**不影响手机**：手机用自己的 DNS。等 1 分钟后扫同一个二维码即可确认；也可用 `node tools/check-tunnel-url.mjs <隧道地址>` 绕开本机 DNS 验证链路。 |
 | 公网模式卡在「正在建立公网隧道…」 | cloudflared 首次下载慢或被墙；也可自行预装 `cloudflared` 到 PATH，插件会优先用现成的。 |
-| 扫码后一直转圈 | 看一眼是不是 token 过期（重启 DSH 会换 token）。关掉再开一次会用新 token 重新生成二维码。 |
+| 扫码后一直转圈 | 看一眼是不是登录令牌过期（**只有重启 DSH 才会换 token**；同一个二维码在进程没重启时一直有效）。关掉再开一次会用新 token 重新生成二维码。 |
+| **用一段时间后，手机整页变成一行字：`dsh web authentication required; reopen the URL printed by dsh web.`** | 手机端那张 DSH 会话 cookie 不在了或没被发送（微信回收网页后重载、清缓存、或从聊天/收藏这类跨站入口回来时 `SameSite=Strict` 不发 cookie）。**现在不会只剩这行字**：代理会把文档 401 换成「重新认证」中转页，点一下即可恢复，不必重新扫码 —— 见 §5。若中转页按钮点了又回来（恢复票也没了），才需要重新扫一次码。先把这句原文当判据：它只由 DSH 的 `BrowserAuth.writeUnauthorized` 产生，且**只作用于 HTML 文档**，所以看到它就说明「DSH 进程和代理都还活着，只是这台手机没票」，不是隧道断了（隧道断了是「无法打开页面」）。 |
 | **手机上点鲸鱼图标展开会话列表，右边还留一条窄缝、没撑满屏** | 窄屏抽屉样式没生效。它在浏览器半里，**手机上刷新一次页面**即可拿到新 bundle（不需要重启客户端、不需要重新扫码）。若刷新后仍然如此，多半是 DSH 换了 `dsh-client-ui-layout` 的 data 钩子 —— 见「第 5 个缺陷」。 |
 
 ---
 
-## 7. 验证
+## 8. 验证
 
 仓库自带三层验证，全部离线可跑（不依赖任何外部二维码库）：
 
 ```powershell
-npm test                      # 单元 + 集成：二维码、改写代理、宿主半、浏览器半真实执行
+npm test                      # 单元 + 集成：二维码、改写代理、宿主半、自愈件、浏览器半真实执行
 npm run verify                # 端到端：自己拉起 desktop profile 的 dsh web，跑通全流程
 $env:WITH_PUBLIC="1"; npm run verify   # 追加公网隧道那一段
 npm run e2e:lan               # 对「已在运行的真实 dsh web」跑一次手机令牌登录链路
 node tools/probe-narrow-drawer.mjs   # 真机(headless Chromium)量窄屏抽屉：手机撑满、折叠态与桌面一字未改
 node tools/doctor.mjs         # 现场体检：判断插件加载到哪一步了
 ```
+
+`npm test` 里与「登录票失效」直接相关的用例（都在 `test/proxy.test.mjs`、`test/host-plugin.test.mjs`、`test/recover.test.mjs`）：
+
+- 文档 401 → 换成中转页；**接口/资源的 401 一字不改地透传**（不往 JSON 客户端里塞 HTML）；
+- `HEAD` 文档不换页（不许有响应体）；
+- DSH 认证成功时补发恢复票（`Set-Cookie` 里同时有 `dsh-auth-*` 与 `dsh-mobile-boot`）；
+- **未认证访客拿不到恢复票**（否则等于把钥匙发给任何能打开隧道的人）；
+- 恢复票 → `/mobile-remote/redeem` → `302` 到入口地址；**错票、关闭连接后的旧票都换不出任何地址**；
+- 中转页与换票入口在 `requestRejection() === 401` 时仍可达（否则就是「401 页要求你先认证」），同时 `/status` 仍必须 401；
+- 恢复票的 cookie 属性（`HttpOnly` / `SameSite=Lax` / 无 `Secure`）与定时安全比较。
 
 `npm run verify` 实际断言的东西（每一条都对应一个真实失败模式）：
 
@@ -381,15 +445,16 @@ AFTER  宽屏(1084)    鼠标  +展开 | sidebar=280  center=804  handle=block r
 
 ---
 
-## 8. 目录结构
+## 9. 目录结构
 
 ```
 dsh-mobile-remote/
 ├── package.json            # exports["."]=宿主半、exports["./client"]=浏览器半、dsh.client 声明
 ├── cordis.patch.yml        # bundle 补丁：把本包 insert 进宿主树
 ├── lib/
-│   ├── host.js             # 宿主半：状态机 + 三条路由 + 生命周期
-│   ├── proxy.js            # 头部改写反向代理（Host/Origin/Referer + 全双工）
+│   ├── host.js             # 宿主半：状态机 + 路由（status/enable/disable + relay/redeem）+ 生命周期
+│   ├── proxy.js            # 改写代理：Host/Origin/Referer + 全双工 + 401 换中转页 + 恢复票注入
+│   ├── recover.js          # 自愈件：恢复票（签发/校验/属性）+ 重新认证中转页
 │   ├── tunnel.js           # cloudflared 受管获取 + quick tunnel + 就绪探针
 │   ├── net.js              # 局域网 IPv4 择优（虚拟网卡垫底）
 │   ├── qr.js               # 自含 QR 编码器（版本 1–10，纠错 L/M）+ PNG 写出
@@ -402,10 +467,13 @@ dsh-mobile-remote/
 
 ---
 
-## 9. 已知限制
+## 10. 已知限制
 
 - 只支持 QR 版本 1–10、纠错等级 L/M（足够容纳最长的 token URL；字节模式，URL 场景不需要更高）。
 - 公网模式用的是 Cloudflare **快速隧道**：域名随机、每次开启都换、不保证 SLA。要固定域名请换成命名隧道（`cloudflared tunnel run` + 自己的 DNS 记录），把 `lib/tunnel.js` 的启动参数换掉即可。
 - 隧道断开有看门狗（会置为 error 并回收代理），但**不会自动重连**——需要手动再点一次开启。
 - 局域网模式不做 HTTPS。局域网内的明文流量仅在本网段可嗅探，敏感场景请用公网模式（https）。
 - 插件不持久化任何偏好（模式/端口每次从默认值开始），因为目前的状态就是一次会话级的「开/关」。
+- 自愈链路对 DSH 的两处实现细节有依赖，都属于「退化了也只会回到扫码」的优雅降级：
+  1. **恢复票的注入时机**是「302/303 且响应里带 `Set-Cookie: dsh-auth-…`」。DSH 若改掉这个 cookie 前缀，代理就不再签发恢复票 —— 中转页照样出现（它只看 401），只是按钮换不出票来，需要重新扫码；
+  2. **中转页只替换「文档」的 401**（`sec-fetch-dest: document` 或 `Accept: text/html`）。接口与静态资源的 401 一字不动地透传，因为客户端自己会处理它们。

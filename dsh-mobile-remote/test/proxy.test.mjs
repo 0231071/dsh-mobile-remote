@@ -90,15 +90,15 @@ async function startOrigin() {
   };
 }
 
-/** 通过代理发一个请求，可显式指定「手机看到」的 Host/Origin。 */
-function viaProxy(proxyPort, path, { host, origin, cookie, referer } = {}) {
+/** 通过代理发一个请求，可显式指定「手机看到」的 Host/Origin/额外头。 */
+function viaProxy(proxyPort, path, { host, origin, cookie, referer, headers: extra, method = 'GET' } = {}) {
   return new Promise((resolve, reject) => {
-    const headers = {};
+    const headers = { ...(extra ?? {}) };
     if (host) headers.host = host;
     if (origin) headers.origin = origin;
     if (referer) headers.referer = referer;
     if (cookie) headers.cookie = cookie;
-    const req = http.request({ host: '127.0.0.1', port: proxyPort, path, headers }, (res) => {
+    const req = http.request({ host: '127.0.0.1', port: proxyPort, path, method, headers }, (res) => {
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => resolve({
@@ -262,3 +262,151 @@ test('代理：stop() 释放端口，重复启动被拒', async () => {
   await new Promise((resolve) => probe.close(resolve));
   await origin.close();
 });
+
+//#region 响应侧：401 换中转页 + 恢复票注入
+
+/** 官方 401 的原文（DSH 的 BrowserAuth.writeUnauthorized 就吐这一行）。 */
+const DSH_401_TEXT = 'dsh web authentication required; reopen the URL printed by dsh web.\n';
+
+/**
+ * 伪造一个「行为与 DSH 一致」的源站：
+ *  - `/?token=LAUNCH` → 303 + `Set-Cookie: dsh-auth-…`（认证成功的那一刻）；
+ *  - 带 `dsh-auth-` cookie → 200 首页；
+ *  - 其余 → 401 + 官方那句纯文本（不设 content-length，让 Node 用 chunked 发，
+ *    这正是现场形态；能证明我们没被分块编码绊住）。
+ */
+async function startDshLike() {
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    seen.push({ url: req.url, cookie: req.headers.cookie ?? null, accept: req.headers.accept ?? null });
+    const url = new URL(req.url, 'http://placeholder');
+    if (url.searchParams.get('token') === 'LAUNCH') {
+      res.writeHead(303, {
+        'cache-control': 'no-store',
+        location: './',
+        'referrer-policy': 'no-referrer',
+        'set-cookie': 'dsh-auth-ABC123=payload; Max-Age=2592000; Path=/; HttpOnly; SameSite=Strict',
+      });
+      res.end();
+      return;
+    }
+    if ((req.headers.cookie ?? '').includes('dsh-auth-ABC123')) {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end('<html>dsh-ok</html>');
+      return;
+    }
+    res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end(DSH_401_TEXT);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return { port: server.address().port, seen, close: () => new Promise((r) => server.close(r)) };
+}
+
+test('代理：文档 401 被换成「重新认证」中转页（手机上不再只剩一行纯文本）', async () => {
+  const origin = await startDshLike();
+  const proxy = new RewriteProxy({ targetPort: origin.port, boot: { secret: 'boot-secret' } });
+  const proxyPort = await proxy.start();
+  try {
+    const page = await viaProxy(proxyPort, '/', {
+      host: 'abc.trycloudflare.com',
+      // 真机上文档导航一定带这几个头之一；这里用 sec-fetch-dest 走最严格的那条判据
+      headers: { 'sec-fetch-dest': 'document', accept: 'text/html,application/xhtml+xml' },
+    });
+    assert.equal(page.status, 401, '语义不变：仍然是未认证');
+    assert.match(page.headers['content-type'], /text\/html/, '换成 HTML 才能给人看');
+    assert.match(page.body, /重新认证/, '必须有可点的动作');
+    assert.match(page.body, /\/mobile-remote\/redeem/, '按钮必须指向换票入口');
+    assert.ok(!page.body.includes('dsh web authentication required'), '原来那句纯文本必须被替换掉');
+    assert.equal(page.headers['cache-control'], 'no-store');
+    assert.match(page.headers['content-security-policy'] ?? '', /default-src 'none'/);
+  } finally {
+    await proxy.stop();
+    await origin.close();
+  }
+});
+
+test('代理：接口/资源的 401 原样透传（不往 JSON 客户端里塞 HTML）', async () => {
+  const origin = await startDshLike();
+  const proxy = new RewriteProxy({ targetPort: origin.port, boot: { secret: 'boot-secret' } });
+  const proxyPort = await proxy.start();
+  try {
+    const api = await viaProxy(proxyPort, '/api/session', {
+      host: 'abc.trycloudflare.com',
+      headers: { accept: 'application/json', 'sec-fetch-dest': 'empty' },
+    });
+    assert.equal(api.status, 401);
+    assert.equal(api.body, DSH_401_TEXT, '非文档请求的 401 必须一字不改地透传');
+
+    const head = await viaProxy(proxyPort, '/', {
+      host: 'abc.trycloudflare.com',
+      method: 'HEAD',
+      headers: { accept: 'text/html' },
+    });
+    assert.equal(head.status, 401, 'HEAD 文档也不能换页面');
+    assert.equal(head.body, '', 'HEAD 不允许有响应体');
+  } finally {
+    await proxy.stop();
+    await origin.close();
+  }
+});
+
+test('代理：DSH 认证成功的那一刻补发恢复票，且未认证访客永远拿不到', async () => {
+  const origin = await startDshLike();
+  const proxy = new RewriteProxy({ targetPort: origin.port, boot: { secret: 'boot-secret' } });
+  const proxyPort = await proxy.start();
+  try {
+    // ① 扫码首跳：DSH 自己下发 dsh-auth-*，代理顺手补一张 dsh-mobile-boot
+    const first = await viaProxy(proxyPort, '/?token=LAUNCH', {
+      host: 'abc.trycloudflare.com',
+      headers: { accept: 'text/html' },
+    });
+    assert.equal(first.status, 303);
+    const cookies = first.headers['set-cookie'] ?? [];
+    assert.ok(cookies.some((c) => c.startsWith('dsh-auth-ABC123=')), 'DSH 自己的票必须原样保留');
+    const boot = cookies.find((c) => c.startsWith('dsh-mobile-boot='));
+    assert.ok(boot, '认证成功时应补发恢复票，实际 Set-Cookie：' + JSON.stringify(cookies));
+    assert.match(boot, /HttpOnly/);
+    assert.match(boot, /SameSite=Lax/);
+
+    // ② 未认证的文档请求：401（且换成了中转页），绝不能被塞一张恢复票
+    const anon = await viaProxy(proxyPort, '/', {
+      host: 'abc.trycloudflare.com',
+      headers: { accept: 'text/html' },
+    });
+    assert.equal(anon.status, 401);
+    assert.ok(!(anon.headers['set-cookie'] ?? []).some((c) => c.includes('dsh-mobile-boot')),
+      '未认证访客拿不到恢复票，否则等于把钥匙发给任何人');
+
+    // ③ 带 cookie 复访仍是正常 200（改写没有破坏正常链路）
+    const authed = await viaProxy(proxyPort, '/', {
+      host: 'abc.trycloudflare.com',
+      cookie: 'dsh-auth-ABC123=payload',
+      headers: { accept: 'text/html' },
+    });
+    assert.equal(authed.status, 200);
+    assert.match(authed.body, /dsh-ok/);
+    assert.ok(!(authed.headers['set-cookie'] ?? []).length, '已认证的普通 200 不该重复发票');
+  } finally {
+    await proxy.stop();
+    await origin.close();
+  }
+});
+
+test('代理：没有恢复票配置时，401 仍换成中转页（只是按钮换不出票来）', async () => {
+  const origin = await startDshLike();
+  const proxy = new RewriteProxy({ targetPort: origin.port });
+  const proxyPort = await proxy.start();
+  try {
+    const page = await viaProxy(proxyPort, '/', { host: 'x.trycloudflare.com', headers: { accept: 'text/html' } });
+    assert.equal(page.status, 401);
+    assert.match(page.body, /重新认证/);
+
+    const first = await viaProxy(proxyPort, '/?token=LAUNCH', { host: 'x.trycloudflare.com', headers: { accept: 'text/html' } });
+    assert.ok(!(first.headers['set-cookie'] ?? []).some((c) => c.includes('dsh-mobile-boot')));
+  } finally {
+    await proxy.stop();
+    await origin.close();
+  }
+});
+
+//#endregion
