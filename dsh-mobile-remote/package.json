@@ -27,7 +27,7 @@
     }
   },
   "scripts": {
-    "test": "node --test --test-force-exit test/qr.test.mjs test/proxy.test.mjs test/host-plugin.test.mjs test/prefs.test.mjs test/recover.test.mjs test/public-ready.test.mjs test/client-bundle.test.mjs",
+    "test": "node --test --test-force-exit test/qr.test.mjs test/proxy.test.mjs test/host-plugin.test.mjs test/prefs.test.mjs test/recover.test.mjs test/tunnel-adopt.test.mjs test/public-ready.test.mjs test/client-bundle.test.mjs",
     "verify": "node tools/verify-plugin.mjs",
     "e2e:lan": "node tools/e2e-lan.mjs"
   }

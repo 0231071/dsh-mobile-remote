@@ -56,6 +56,12 @@ export function defaultPrefs() {
     mode: 'lan',
     lan: { ip: null, port: null },
     public: { provider: 'quick', host: null, port: null },
+    /**
+     * 上次那条 quick 隧道（pid / 域名 / 端口）。DSH 退出时**不杀** cloudflared，
+     * 把它记在这里；下次启动先试「能不能还绑回这个端口 + 这个域名是否还转回到我们」，
+     * 能就沿用同一个域名 —— 这是「重启后旧二维码仍然有效」在快速隧道下唯一的实现方式。
+     */
+    tunnel: null,
     entryKey: null,
     bootSecret: null,
   };
@@ -87,6 +93,23 @@ function asHost(value) {
 }
 
 /**
+ * 归一化隧道记录。只认「pid 是正整数 + url 是 trycloudflare 域名 + port 是端口」这三样
+ * 同时成立的记录 —— 缺任何一样都没有复用价值，直接丢掉（丢掉的后果只是下次重新建隧道）。
+ */
+function asTunnelRecord(value) {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const input = /** @type {Record<string, any>} */ (value);
+  const pid = Number.isInteger(input.pid) && input.pid > 0 ? input.pid : null;
+  const port = asPort(input.port);
+  const url = typeof input.url === 'string' && /^https:\/\/[a-z0-9][a-z0-9-]*\.trycloudflare\.com$/.test(input.url)
+    ? input.url
+    : null;
+  if (pid === null || port === null || url === null) return null;
+  const startedAt = Number.isFinite(input.startedAt) ? input.startedAt : null;
+  return { pid, url, port, startedAt };
+}
+
+/**
  * 把任意 JSON 归一化成合法偏好。**绝不抛异常**：坏字段一律回落到默认。
  * @param {unknown} raw
  * @returns {ReturnType<typeof defaultPrefs>}
@@ -111,6 +134,7 @@ export function normalizePrefs(raw) {
     prefs.public.port = asPort(input.public.port);
   }
 
+  prefs.tunnel = asTunnelRecord(input.tunnel);
   prefs.entryKey = asKey(input.entryKey);
   prefs.bootSecret = asKey(input.bootSecret);
   return prefs;

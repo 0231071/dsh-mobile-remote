@@ -182,8 +182,16 @@ export async function ensureCloudflared(log = () => {}, signal) {
 /**
  * 起一条 quick tunnel 指向本机代理端口。
  *
- * @param {{ binPath: string, port: number, log?: (message: string) => void, signal?: AbortSignal }} options
- * @returns {Promise<{ publicUrl: string, stop: () => Promise<void>, exited: Promise<number|null> }>}
+ * **为什么输出重定向到文件而不是管道**：quick tunnel 的域名是随机的、每次新建就换，所以
+ * 「重启后旧二维码还有效」只能靠**让这个 cloudflared 进程活过 DSH 重启**（见 detach()）。
+ * 而管道是宿主进程持有的句柄：宿主一退出，读端就没了，cloudflared 下一次写日志就可能
+ * 被 EPIPE 干掉 —— 那样"存活"就成了空话。重定向到文件则各持一份句柄，互不影响，
+ * 顺带还给现场留下了一份 cloudflared 日志（出问题时有东西可看）。
+ *
+ * @param {{ binPath: string, port: number, log?: (message: string) => void,
+ *   signal?: AbortSignal, logPath?: string }} options
+ * @returns {Promise<{ publicUrl: string, pid: number|undefined, logPath: string,
+ *   stop: () => Promise<void>, detach: () => void, exited: Promise<number|null> }>}
  */
 export async function startQuickTunnel(options) {
   const log = options.log ?? (() => {});
@@ -195,21 +203,65 @@ export async function startQuickTunnel(options) {
     '--no-autoupdate',
   ];
 
+  const logPath = options.logPath ?? path.join(managedBinDir(), '..', 'cloudflared.log');
+  try {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.writeFileSync(logPath, '', 'utf8'); // 截断：域名要从"这次"的日志里认，不能读到上次的
+  } catch {
+    /* 日志写不了不影响起隧道 */
+  }
+
+  let logFd;
+  try {
+    logFd = fs.openSync(logPath, 'a');
+  } catch {
+    logFd = 'ignore';
+  }
+
   const child = spawn(options.binPath, args, {
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['ignore', logFd, logFd],
     windowsHide: true,
   });
+  // 父进程这份句柄立刻关掉：子进程已经各自持有，留着只会拖住宿主退出。
+  if (typeof logFd === 'number') {
+    try {
+      fs.closeSync(logFd);
+    } catch {
+      /* 无所谓 */
+    }
+  }
 
-  let stderrTail = '';
+  const readLogTail = (size = 2000) => {
+    try {
+      const text = fs.readFileSync(logPath, 'utf8');
+      return text.slice(-size);
+    } catch {
+      return '';
+    }
+  };
+
   let settled = false;
 
   const publicUrl = await new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       finish(new Error(`cloudflared 在 ${URL_TIMEOUT_MS / 1000}s 内未返回公网地址`));
     }, URL_TIMEOUT_MS);
+    // 轮询日志文件找域名。100ms 一次、最多 900 次（90s），比逐块读管道略钝一点，
+    // 但换来的是「宿主随时可以退出而隧道不受影响」。
+    const poll = setInterval(() => {
+      const match = TRYCLOUDFLARE.exec(readLogTail(4000));
+      if (match) {
+        log(`公网隧道就绪：${match[0]}`);
+        finish(null, match[0]);
+        return;
+      }
+      if (child.exitCode !== null) {
+        finish(new Error(`cloudflared 提前退出（code=${child.exitCode}）：${readLogTail().trim().split('\n').slice(-3).join(' | ')}`));
+      }
+    }, 100);
 
-    const exited = (code, signal) => {
-      finish(new Error(`cloudflared 提前退出（code=${code} signal=${signal}）：${stderrTail.trim().split('\n').slice(-3).join(' | ')}`));
+    const exited = (code, sig) => {
+      finish(new Error(`cloudflared 提前退出（code=${code} signal=${sig}）：${readLogTail().trim().split('\n').slice(-3).join(' | ')}`));
     };
     // 插件卸载时必须立刻放弃等待：否则这个 90s 的地址等待会顶穿宿主停机窗口。
     const onAbort = () => finish(new Error('已取消：插件正在卸载'));
@@ -217,10 +269,11 @@ export async function startQuickTunnel(options) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearInterval(poll);
       child.off('exit', exited);
       signal?.removeEventListener('abort', onAbort);
       if (error) {
-        // 取消与失败都不能把 cloudflared 留在系统里：子进程的 stdio 管道会钉住宿主进程。
+        // 取消与失败都不能把 cloudflared 留在系统里。
         try {
           child.kill();
         } catch {
@@ -230,21 +283,9 @@ export async function startQuickTunnel(options) {
       } else resolve(url);
     };
 
-    const scan = (chunk, isErr) => {
-      const text = chunk.toString('utf8');
-      if (isErr) stderrTail = (stderrTail + text).slice(-4000);
-      const match = TRYCLOUDFLARE.exec(text);
-      if (match) {
-        log(`公网隧道就绪：${match[0]}`);
-        finish(null, match[0]);
-      }
-    };
-
     if (signal?.aborted) onAbort();
     else signal?.addEventListener('abort', onAbort, { once: true });
 
-    child.stdout.on('data', (chunk) => scan(chunk, false));
-    child.stderr.on('data', (chunk) => scan(chunk, true));
     child.on('error', (error) => finish(new Error(`无法启动 cloudflared：${error.message}`)));
     child.on('exit', exited);
   });
@@ -259,13 +300,15 @@ export async function startQuickTunnel(options) {
 
   return {
     publicUrl,
+    pid: child.pid,
+    logPath,
     exited,
     /**
      * 停掉隧道并等子进程真正退出。
      *
-     * 必须等到退出：cloudflared 的 stdout/stderr 管道是宿主进程持有的句柄，子进程还在跑
-     * （或管道尚未关闭）时宿主事件循环不会排空，桌面端就会把停机判成「未优雅收尾」并
-     * 拒绝安装更新。
+     * 必须等到退出：子进程还在跑时宿主事件循环不会排空，桌面端就会把停机判成
+     * 「未优雅收尾」并拒绝安装更新（stdio 已改为文件，但这个纪律保留 —— 用户点
+     * 「关闭手机连接」时确实该把它关掉）。
      *
      * @returns {Promise<void>} 子进程退出，或等待超过 TUNNEL_STOP_GRACE_MS
      */
@@ -276,10 +319,130 @@ export async function startQuickTunnel(options) {
         /* 已退出 */
       }
       await Promise.race([exited, sleep(TUNNEL_STOP_GRACE_MS)]);
-      child.stdout?.destroy();
-      child.stderr?.destroy();
+    },
+    /**
+     * **放开**这个子进程：不杀它，而是把它从宿主的事件循环里摘出去，让它活过 DSH 重启。
+     *
+     * 这是「重启后旧二维码仍然有效」的关键一步：同一个 cloudflared 进程 = 同一个域名。
+     * 调用方必须自己把 pid/url/端口记到状态文件里，下次启动才认得出它。
+     */
+    detach: () => {
+      try {
+        child.unref();
+      } catch {
+        /* 无所谓 */
+      }
     },
   };
+}
+
+/**
+ * 身份探测：这条域名现在是不是**转到我们手上**。
+ *
+ * 刻意不复用 `probeDirectFetch`：那个只要「有响应且 <500」就算通（对"域名生效了吗"够用），
+ * 但这里要回答的是「这条隧道还指向**我**吗」。任何 4xx/5xx 页面（比如 Cloudflare 的错误页、
+ * 或别的程序恰好占了端口）都可能"有响应"，所以要求 **200 + 正文恰好是 `ok`** ——
+ * 那是我自己 `/mobile-remote/health` 的固定输出，别的程序给不出来。
+ *
+ * @param {string} url 隧道地址，如 `https://abc.trycloudflare.com`
+ * @returns {Promise<{ ok: boolean, error?: string }>}
+ */
+export async function probeTunnelIdentity(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8_000);
+  try {
+    const response = await fetch(`${url}/mobile-remote/health`, { redirect: 'manual', signal: controller.signal });
+    if (response.status !== 200) return { ok: false, error: `健康检查 HTTP ${response.status}` };
+    const text = (await response.text()).trim();
+    if (text !== 'ok') return { ok: false, error: `健康检查正文不对：${text.slice(0, 40)}` };
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: describeFetchError(error) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 某条记录里的 quick 隧道还能不能用。
+ *
+ * 判据刻意只有一条硬证据：**它现在是否把请求转回到我们手上**（`/mobile-remote/health`
+ * 返回 200 且正文是 `ok`）。调用方必须**先自己绑上那个端口**再调这里 —— 否则那个 200
+ * 可能来自别的程序。用「端口归属 + 身份探测」而不去信 pid，是因为 pid 会被系统复用：
+ * 活着的 pid 不证明它是我们的 cloudflared，但「我绑着这个端口、且这个域名打过来到了我这儿」
+ * 是硬事实。
+ *
+ * @param {{ pid?: number, url?: string, port?: number } | null} record
+ * @param {{ probe?: (url: string) => Promise<{ ok: boolean, error?: string }>,
+ *   timeoutMs?: number, intervalMs?: number, signal?: AbortSignal }} [options]
+ * @returns {Promise<{ ok: boolean, error?: string }>}
+ */
+export async function adoptTunnel(record, options = {}) {
+  const url = typeof record?.url === 'string' ? record.url : null;
+  if (url === null || !TRYCLOUDFLARE.test(url)) return { ok: false, error: '没有可复用的隧道地址' };
+  const probe = options.probe ?? probeTunnelIdentity;
+  const deadline = Date.now() + (options.timeoutMs ?? 15_000);
+  const interval = options.intervalMs ?? 1_000;
+  let last = '尚未尝试';
+  // 重启后 DSH 自己的插件路由要先挂上（apply 已经发生），再给隧道几秒钟把连接确认回来，
+  // 所以这里是「多次重试直到超时」，不是一次就判死。
+  while (Date.now() < deadline) {
+    if (options.signal?.aborted) return { ok: false, error: '已取消' };
+    const result = await probe(url);
+    if (result.ok) return { ok: true };
+    last = result.error ?? '探测失败';
+    await sleep(interval, options.signal);
+  }
+  return { ok: false, error: last };
+}
+
+/**
+ * 尽力回收一条不再可用的隧道进程。
+ *
+ * 只在**探测失败**之后调用（也就是"这条隧道已经没用"），且全程 try/catch：
+ * 杀不掉就留着 —— 一个僵尸 cloudflared 只是浪费，杀错进程才是事故。pid 复用是已知的
+ * 残余风险，所以这里只做「活着就尽力杀」，并在 README 里写明手动清理办法。
+ *
+ * @param {{ pid?: number } | null} record
+ * @param {(message: string) => void} [log]
+ * @returns {boolean} 是否发出了信号
+ */
+export function reapTunnelProcess(record, log = () => {}) {
+  const pid = record?.pid;
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0); // 活着才继续
+  } catch {
+    return false;
+  }
+  try {
+    process.kill(pid);
+    log(`已回收旧的 cloudflared 进程（pid=${pid}）`);
+    return true;
+  } catch (error) {
+    log(`回收旧 cloudflared 失败（pid=${pid}）：${error.message}`);
+    return false;
+  }
+}
+
+/**
+ * 端口 + 复用结论 → 该怎么起隧道。**纯函数**，把决策从副作用里摘出来便于钉死行为。
+ *
+ * @param {{ record: { url?: string, port?: number } | null, boundPort: number, adopted: boolean }} input
+ * @returns {{ action: 'adopt' | 'fresh', reapRecord: object | null, reason: string }}
+ */
+export function planTunnel({ record, boundPort, adopted }) {
+  const recorded = record ?? null;
+  const portMatches = recorded !== null && recorded.port === boundPort;
+  if (adopted && portMatches) {
+    return { action: 'adopt', reapRecord: null, reason: '端口与健康探测都通过：沿用同一个域名' };
+  }
+  if (recorded === null) return { action: 'fresh', reapRecord: null, reason: '没有旧记录' };
+  if (!portMatches) {
+    // 端口没绑回来 → 隧道指着的是别人（或我们被迫换了端口）→ 旧域名不能用了，顺手尽力回收。
+    return { action: 'fresh', reapRecord: recorded, reason: `端口对不上（记录 ${recorded.port}，实际 ${boundPort}）` };
+  }
+  return { action: 'fresh', reapRecord: recorded, reason: '健康探测没过：隧道已失效' };
 }
 
 /**

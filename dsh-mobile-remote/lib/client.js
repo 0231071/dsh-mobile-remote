@@ -577,8 +577,12 @@ window.__ModuleLoader__.load({
               key: 'stability',
               style: { fontSize: 12, color: state.entryStable ? C.success : C.warn, lineHeight: '18px' },
             }, state.entryStable
-              ? '这条地址是长期入口：DSH 重启后仍然有效，手机不用重扫。'
-              : '注意：快速隧道的域名每次开启都会换，重启后这条地址会失效（改用「自有域名」可避免）。'),
+              ? (state.tunnelAdopted
+                ? '已复用上次的公网隧道：域名没变，DSH 重启后旧二维码仍然有效，手机不用重扫。'
+                : '这条地址是长期入口：DSH 重启后仍然有效，手机不用重扫。')
+              : '这条地址只在本次运行内有效：快速隧道的域名每次新建都换。'
+                + '下次启动会自动尝试复用同一条隧道，成功的话旧二维码也还能用；'
+                + '想要万无一失就用「自有域名」那一档。'),
             h('div', { key: 'copy', style: { display: 'flex', gap: 10, flexWrap: 'wrap' } }, [
               h('button', {
                 key: 'btn',
@@ -620,7 +624,8 @@ window.__ModuleLoader__.load({
         h('div', { key: 'b' }, '· 手机首次扫码由 DSH 校验令牌并下发会话 cookie，之后凭 cookie 访问；代理不接触 DSH 的鉴权判断。'),
         h('div', { key: 'c' }, '· 公网模式依赖 cloudflared 快速隧道（首次会自动下载）；微信内置浏览器可直接打开该链接。'),
         h('div', { key: 'd' }, '· 手机端登录票失效时（微信回收网页、清缓存、从聊天再次打开都会这样），会显示「重新认证」页：点一下即可恢复，不用扫第二次码。'),
-        h('div', { key: 'e' }, '· 二维码里是「长期入口」：只要主机名与端口不变（局域网 / 自有域名），DSH 重启后同一条链接仍然有效；快速隧道每次换域名，所以做不到。'),
+        h('div', { key: 'e' }, '· 二维码里是「长期入口」：主机名与端口不变（局域网 / 自有域名）就一定跨重启有效；'
+          + '快速隧道下插件会让 cloudflared 活过 DSH 重启并复用它 —— 复用成功同样不用重扫，失败则出一张新码。'),
         h('div', { key: 'f' }, state?.statePath ? `· 偏好与长期密钥存在 ${state.statePath}；换电脑或想彻底作废旧链接，点上面的「重置长期入口」。` : ''),
       ]));
 

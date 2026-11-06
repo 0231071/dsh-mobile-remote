@@ -115,6 +115,18 @@ test('钥匙补齐：只在缺失时生成，已有的一律不覆盖', () => {
   assert.equal(second.prefs.bootSecret, first.prefs.bootSecret);
 });
 
+test('隧道记录：三样齐全才保留，缺一样就丢掉（丢掉的代价只是下次重建隧道）', () => {
+  const good = { pid: 4321, url: 'https://abc-def.trycloudflare.com', port: 51234, startedAt: 1700000000000 };
+  assert.deepEqual(normalizePrefs({ tunnel: good }).tunnel, good);
+
+  assert.equal(normalizePrefs({ tunnel: { ...good, url: 'https://evil.example.com' } }).tunnel, null,
+    '只接受 trycloudflare 域名');
+  assert.equal(normalizePrefs({ tunnel: { ...good, pid: 0 } }).tunnel, null);
+  assert.equal(normalizePrefs({ tunnel: { ...good, port: 70000 } }).tunnel, null);
+  assert.equal(normalizePrefs({ tunnel: 'nope' }).tunnel, null);
+  assert.equal(normalizePrefs({}).tunnel, null, '默认没有可复用的隧道');
+});
+
 test('randomKey：每次不同，且是 cookie/URL 安全的字符集', () => {
   const keys = new Set(Array.from({ length: 50 }, () => randomKey()));
   assert.equal(keys.size, 50, '不应重复');

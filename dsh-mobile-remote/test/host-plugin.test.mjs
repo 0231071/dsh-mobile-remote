@@ -523,8 +523,7 @@ test('重置长期入口：旧密钥立刻失效，新密钥可用', async () =>
   await hit(routes, '/mobile-remote/disable', { method: 'POST' });
 });
 
-test('自有域名模式缺配置：明确报错且不留下监听中的端口', async () => {
-  const { ctx, routes } = makeCtx();
+test('自有域名模式缺配置：明确报错且不留下监听中的端口', async () => {  const { ctx, routes } = makeCtx();
   apply(ctx);
 
   await hit(routes, '/mobile-remote/enable', {
@@ -538,6 +537,54 @@ test('自有域名模式缺配置：明确报错且不留下监听中的端口',
 });
 
 //#endregion
+
+test('模式来回切：公网模式不得覆盖局域网端口（否则局域网入口跨重启就不稳了）', async () => {
+  const { ctx, routes } = makeCtx();
+  const disposers = [];
+  ctx.effect = (callback) => {
+    const dispose = callback();
+    disposers.push(dispose);
+    return () => { if (typeof dispose === 'function') dispose(); };
+  };
+  apply(ctx);
+
+  try {
+    await hit(routes, '/mobile-remote/enable', { method: 'POST', body: { mode: 'lan', autoStart: true } });
+    const lan = await waitForOn(routes);
+    assert.equal(lan?.phase, 'on', `前置：局域网应开启，实际 ${lan?.phase}（${lan?.lastError ?? lan?.message}）`);
+    const lanPort = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')).lan.port;
+    assert.equal(lanPort, lan.proxyPort, '局域网端口应被记住，重启后入口才逐字节一致');
+
+    // 切到「自有域名」模式：用一个刚释放掉的固定端口
+    const net = await import('node:net');
+    const freePort = await new Promise((resolve) => {
+      const probe = net.createServer();
+      probe.listen(0, '0.0.0.0', () => {
+        const assigned = probe.address().port;
+        probe.close(() => resolve(assigned));
+      });
+    });
+    await hit(routes, '/mobile-remote/enable', {
+      method: 'POST',
+      body: {
+        mode: 'public',
+        publicProvider: 'stable',
+        publicHost: 'dsh.example.com',
+        publicPort: freePort,
+        autoStart: true,
+      },
+    });
+    const pub = await waitForOn(routes);
+    assert.equal(pub?.phase, 'on', `切公网应成功（固定端口 ${freePort}），实际 ${pub?.phase}（${pub?.lastError ?? pub?.message}）`);
+    assert.equal(pub.proxyPort, freePort, '自有域名模式必须用指定的固定端口');
+
+    const saved = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    assert.equal(saved.public.port, freePort, '公网端口应该记在 public.port');
+    assert.equal(saved.lan.port, lanPort, '公网模式绝不能把它的端口写进 lan.port');
+  } finally {
+    for (const dispose of disposers) await dispose();
+  }
+});
 
 /**
  * 一个「行为与 DSH 一致」的假源站。

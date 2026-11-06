@@ -35,7 +35,15 @@ import {
   requestHasBootTicket,
   tryingCookieSetCookie,
 } from './recover.js';
-import { ensureCloudflared, probeDirectFetch, startQuickTunnel, waitForPublicReady } from './tunnel.js';
+import {
+  adoptTunnel,
+  ensureCloudflared,
+  planTunnel,
+  probeDirectFetch,
+  reapTunnelProcess,
+  startQuickTunnel,
+  waitForPublicReady,
+} from './tunnel.js';
 
 /**
  * 激活轨迹：往 `$DSH_HOME/mobile-remote/activation.log` 追加一行。
@@ -228,6 +236,8 @@ export function apply(ctx) {
     publicPort: null,
     /** 重启后是否自动开启（上次是开的就记住） */
     autoStart: false,
+    /** 这次的公网隧道是不是「复用」上次那条（复用成功 = 旧二维码仍然有效） */
+    tunnelAdopted: false,
     /** 状态文件路径（设置页直接显示，便于排查） */
     statePath: prefsPath(),
     publicUrl: null,
@@ -286,11 +296,38 @@ export function apply(ctx) {
     state.updatedAt = Date.now();
   }
 
-  async function stop(reason) {
+  /**
+   * 收掉当前连接。
+   *
+   * @param {string} [reason]
+   * @param {{ keepTunnel?: boolean }} [options] `keepTunnel` 只在「插件正在卸载 / 宿主即将退出」
+   *   （也就是用户**没有**点关闭）时为真：此时 quick 隧道不杀，改为 detach 并把 pid/域名/端口
+   *   记进状态文件，下次启动就能沿用同一个域名 —— 否则「重启后旧二维码仍然有效」在快速隧道
+   *   下无从谈起。用户点「关闭手机连接」时永远是 false：点了关闭就该真的关掉。
+   */
+  async function stop(reason, options = {}) {
     if (tunnel) {
       const active = tunnel;
       tunnel = null;
-      await active.stop();
+      if (options.keepTunnel === true && typeof active.detach === 'function') {
+        active.detach();
+        prefs.tunnel = {
+          pid: active.pid,
+          url: active.publicUrl,
+          port: state.proxyPort,
+          startedAt: Date.now(),
+        };
+        savePrefs(prefs);
+        trace(`tunnel detached for next launch: ${active.publicUrl} (pid=${active.pid}, port=${state.proxyPort})`);
+        log(`已把公网隧道留给下次启动复用：${active.publicUrl}`);
+      } else {
+        await active.stop();
+        // 显式关闭 → 隧道已经杀掉，记录必须一并清掉，否则下次会去探一个死域名。
+        if (prefs.tunnel !== null) {
+          prefs.tunnel = null;
+          savePrefs(prefs);
+        }
+      }
     }
     if (proxy) {
       await proxy.stop();
@@ -305,6 +342,7 @@ export function apply(ctx) {
     state.authUrl = null;
     state.entryUrl = null;
     state.entryStable = false;
+    state.tunnelAdopted = false;
     state.publicUrl = null;
     state.provider = null;
     state.proxyPort = null;
@@ -374,17 +412,23 @@ export function apply(ctx) {
     // 恢复票用**持久化**的密钥：手机浏览器里那张票跨重启依然有效，才能做到「零操作恢复」。
     const instance = new RewriteProxy({ targetPort, log, boot: { secret: prefs.bootSecret } });
 
-    // 端口：lan 允许回落，stable 必须固定。
+    // 端口：lan 允许回落，stable 必须固定，quick 优先绑回上次用的那个（要复用隧道就得是同一个）。
     const desiredPort = mode === 'lan'
       ? (Number.isInteger(options.port) && options.port > 0 ? options.port : prefs.lan.port)
-      : (provider === 'stable' ? publicPort : (Number.isInteger(options.port) && options.port > 0 ? options.port : 0));
+      : provider === 'stable'
+        ? publicPort
+        : (Number.isInteger(options.port) && options.port > 0 ? options.port : (prefs.tunnel?.port ?? 0));
+    // 公网模式只听回环：cloudflared 走的就是 127.0.0.1，没有理由把端口同时摊给整个局域网。
+    const bindHost = mode === 'lan' ? '0.0.0.0' : '127.0.0.1';
+    const canFallback = mode === 'lan' || provider === 'quick';
     try {
-      await instance.start({ port: desiredPort ?? 0 });
+      await instance.start({ host: bindHost, port: desiredPort ?? 0 });
     } catch (error) {
-      if (mode === 'lan' && desiredPort) {
+      if (desiredPort && canFallback) {
         // 上次那个端口被别的程序占走了：换随机端口继续用，别让「重启后自动开启」卡死在这里。
-        trace(`局域网端口 ${desiredPort} 不可用，回落到随机端口：${error.message}`);
-        await instance.start({ port: 0 });
+        // 代价说清楚：端口一变，原来那条隧道就接不上了，旧二维码这次用不上。
+        trace(`${bindHost}:${desiredPort} 不可用，回落到随机端口：${error.message}`);
+        await instance.start({ host: bindHost, port: 0 });
       } else {
         state.phase = 'error';
         state.lastError = `代理端口监听失败：${error.message}`
@@ -427,51 +471,94 @@ export function apply(ctx) {
           touch();
         })();
       } else if (mode === 'public') {
-        const binPath = await ensureCloudflared(log, lifecycle.signal);
-        const active = await startQuickTunnel({ binPath, port: instance.port, log, signal: lifecycle.signal });
-        tunnel = active;
-        state.provider = 'cloudflared';
-        state.publicUrl = active.publicUrl;
-        base = active.publicUrl;
-
-        // 隧道是外部进程，断网/被墙/被回收都可能让它悄悄退出。没有看门狗的话，
-        // 界面会一直显示「已连接」，而手机其实已经连不上了。
-        void active.exited.then((code) => {
-          if (tunnel !== active) return; // 已被正常关闭
-          warn(`cloudflared 意外退出（code=${code}）`);
-          trace(`cloudflared exited unexpectedly code=${code}`);
-          void serialize(() => {
-            if (tunnel !== active) return undefined;
-            return stop('公网隧道已断开，请重新开启');
-          }).then(() => {
-            state.phase = 'error';
-            state.lastError = `cloudflared 已退出（code=${code}）`;
-            state.message = '公网隧道已断开，请重新开启或改用局域网模式';
-            touch();
-          });
-        });
-
-        // 探针**不要**在这里 await：quick tunnel 的临时子域 DNS 记录要几十秒才生效
-        // （实测约 67 秒，见 tools/measure-dns-window.mjs）。若阻塞等待，二维码会迟迟
-        // 不出，用户以为坏了。所以先把二维码交给用户，探针丢到后台慢慢轮询。
-        // 但文案必须如实：这段时间**扫码一定失败**，要说清楚"等约 1 分钟"。
-        state.message = PUBLIC_DNS_PENDING_MESSAGE;
-        void (async () => {
-          const ready = await waitForPublicReady(base, { log, timeoutMs: 180_000, signal: lifecycle.signal });
-          if (tunnel !== active || lifecycle.signal.aborted) return; // 期间已被关闭 / 插件正在卸载
-          const verdict = publicReadinessMessage(ready);
-          state.message = verdict.message;
-          state.lastError = verdict.lastError;
-          if (verdict.ready) {
-            log(`公网探针通过（HTTP ${ready.status}，直连，域名已生效）`);
+        // ── 先试「复用上次那条隧道」─────────────────────────────────────────
+        // 快速隧道的域名是随机的、新建就换；能沿用同一个域名的唯一办法是**那个 cloudflared
+        // 进程还活着**（DSH 上次退出时我们把它 detach 了）。判据只有一条硬证据：
+        // 我刚绑上这个端口，且这个域名打过来确实到了我这儿（/health 200）。
+        let adopted = false;
+        if (prefs.tunnel !== null) {
+          const verdict = await adoptTunnel(prefs.tunnel, { signal: lifecycle.signal, timeoutMs: 12_000 });
+          const plan = planTunnel({ record: prefs.tunnel, boundPort: instance.port, adopted: verdict.ok });
+          if (plan.action === 'adopt') {
+            adopted = true;
+            const record = prefs.tunnel;
+            tunnel = {
+              publicUrl: record.url,
+              pid: record.pid,
+              // 复用的是别人（上一个进程）起的子进程，手上没有句柄，观测不到它退出；
+              // 兜底是下次启动时的健康探测（失败就重建，不会静默失效）。
+              exited: new Promise(() => {}),
+              stop: async () => { reapTunnelProcess(record, log); },
+              detach: () => {},
+            };
+            state.provider = 'cloudflared';
+            state.publicUrl = record.url;
+            state.tunnelAdopted = true;
+            base = record.url;
+            state.message = `已复用上次的公网隧道（${record.url}）—— 旧二维码仍然有效。`;
+            log(`复用上次的公网隧道：${record.url}`);
+            trace(`tunnel adopted: ${record.url} port=${record.port}`);
           } else {
-            // 措辞很重要：探针没通过 ≠ 手机一定连不上。这台机器解析不到临时子域是常态，
-            // 手机用的是它自己的 DNS。所以给"未能确认"+ 可照做的动作，不喊"失效"。
-            warn(`公网探针未确认域名生效：${ready.error ?? '仅边缘回源可达'}`);
-            trace(`public probe not confirmed: ${ready.error ?? 'edge-only'}`);
+            trace(`tunnel not adoptable（${plan.reason}；${verdict.error ?? '无错误'}），将重建`);
+            if (plan.reapRecord !== null) reapTunnelProcess(plan.reapRecord, log);
+            prefs.tunnel = null;
+            savePrefs(prefs);
           }
-          touch();
-        })();
+        }
+
+        if (!adopted) {
+          const binPath = await ensureCloudflared(log, lifecycle.signal);
+          const active = await startQuickTunnel({ binPath, port: instance.port, log, signal: lifecycle.signal });
+          tunnel = active;
+          state.provider = 'cloudflared';
+          state.publicUrl = active.publicUrl;
+          base = active.publicUrl;
+          // 立刻把这次的隧道记进状态文件：即使宿主随后被强杀，下次启动也还认得出它。
+          prefs.tunnel = { pid: active.pid, url: active.publicUrl, port: instance.port, startedAt: Date.now() };
+          savePrefs(prefs);
+
+          // 隧道是外部进程，断网/被墙/被回收都可能让它悄悄退出。没有看门狗的话，
+          // 界面会一直显示「已连接」，而手机其实已经连不上了。
+          void active.exited.then((code) => {
+            if (tunnel !== active) return; // 已被正常关闭
+            warn(`cloudflared 意外退出（code=${code}）`);
+            trace(`cloudflared exited unexpectedly code=${code}`);
+            void serialize(() => {
+              if (tunnel !== active) return undefined;
+              return stop('公网隧道已断开，请重新开启');
+            }).then(() => {
+              state.phase = 'error';
+              state.lastError = `cloudflared 已退出（code=${code}）`;
+              state.message = '公网隧道已断开，请重新开启或改用局域网模式';
+              touch();
+            });
+          });
+        }
+
+        if (!adopted) {
+          // 探针**不要**在这里 await：quick tunnel 的临时子域 DNS 记录要几十秒才生效
+          // （实测约 67 秒，见 tools/measure-dns-window.mjs）。若阻塞等待，二维码会迟迟
+          // 不出，用户以为坏了。所以先把二维码交给用户，探针丢到后台慢慢轮询。
+          // 但文案必须如实：这段时间**扫码一定失败**，要说清楚"等约 1 分钟"。
+          const current = tunnel;
+          state.message = PUBLIC_DNS_PENDING_MESSAGE;
+          void (async () => {
+            const ready = await waitForPublicReady(base, { log, timeoutMs: 180_000, signal: lifecycle.signal });
+            if (tunnel !== current || lifecycle.signal.aborted) return; // 期间已被关闭 / 插件正在卸载
+            const verdict = publicReadinessMessage(ready);
+            state.message = verdict.message;
+            state.lastError = verdict.lastError;
+            if (verdict.ready) {
+              log(`公网探针通过（HTTP ${ready.status}，直连，域名已生效）`);
+            } else {
+              // 措辞很重要：探针没通过 ≠ 手机一定连不上。这台机器解析不到临时子域是常态，
+              // 手机用的是它自己的 DNS。所以给"未能确认"+ 可照做的动作，不喊"失效"。
+              warn(`公网探针未确认域名生效：${ready.error ?? '仅边缘回源可达'}`);
+              trace(`public probe not confirmed: ${ready.error ?? 'edge-only'}`);
+            }
+            touch();
+          })();
+        }
       } else {
         const ips = safeLanIps();
         state.lanIps = ips;
@@ -490,8 +577,9 @@ export function apply(ctx) {
       state.baseUrl = base;
       state.authUrl = authUrl;
       state.entryUrl = entryUrl;
-      // 公网 quick 模式的域名每次开启都换，谈不上稳定；其余两种模式入口是稳定的。
-      state.entryStable = mode === 'lan' || provider === 'stable';
+      // 公网 quick 模式的域名每次**新建隧道**都会换；但只要能复用上次那条隧道
+      // （tunnelAdopted），它同样跨重启有效 —— 所以这里按事实标注，不按模式想当然。
+      state.entryStable = mode === 'lan' || provider === 'stable' || state.tunnelAdopted;
       state.qrPng = qrPngDataUrl(entryUrl, { scale: 6, margin: 3 });
       state.enabled = true;
       state.phase = 'on';
@@ -507,7 +595,12 @@ export function apply(ctx) {
     touch();
     // 记住这次成功的形态：重启后按它原样拉起，并让入口 URL 与这次逐字节一致。
     prefs.mode = mode;
-    prefs.lan = { ip: state.selectedIp ?? prefs.lan.ip, port: state.proxyPort };
+    // ⚠️ 只有局域网模式才更新 lan 偏好。公网的代理端口要么是随机的（quick）、要么已经
+    // 单独存在 public.port 里（stable）；把它写进 lan.port 会让「切回局域网」时去试一个
+    // 毫不相干的端口，也让「局域网入口跨重启稳定」这条在模式来回切之后不成立。
+    if (mode === 'lan') {
+      prefs.lan = { ip: state.selectedIp ?? prefs.lan.ip, port: state.proxyPort };
+    }
     if (mode === 'public') {
       prefs.public = {
         provider,
@@ -810,7 +903,9 @@ export function apply(ctx) {
       // 收尾」并拒绝安装更新。上面的中止信号保证这个 promise 很快落地。
       lifecycle.abort();
       trace('teardown: ctx.effect disposer called');
-      return serialize(() => stop('插件已卸载')).then((value) => {
+      // keepTunnel：用户没点「关闭手机连接」，只是宿主在退出/重启。公网快速隧道留活口，
+      // 下次启动复用它 —— 这就是「重启后旧二维码仍然有效」的全部依据。
+      return serialize(() => stop('插件已卸载', { keepTunnel: true })).then((value) => {
         trace('teardown: cleanup resolved');
         return value;
       });
