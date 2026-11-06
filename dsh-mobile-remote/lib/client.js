@@ -214,6 +214,21 @@ window.__ModuleLoader__.load({
       };
     }
 
+    /** 设置项里的文本输入框。 */
+    function fieldInput() {
+      return {
+        flex: '1 1 200px',
+        minWidth: 160,
+        padding: '7px 10px',
+        borderRadius: 8,
+        border: `1px solid ${C.borderStrong}`,
+        background: C.layer1,
+        color: C.text,
+        fontSize: 13,
+        lineHeight: '18px',
+      };
+    }
+
     function MobileRemoteSection() {
       const [state, setState] = useState(null);
       const [error, setError] = useState(null);
@@ -221,6 +236,13 @@ window.__ModuleLoader__.load({
       const [mode, setMode] = useState('lan');
       const [ip, setIp] = useState(null);
       const [copied, setCopied] = useState(false);
+      // 公网「自有域名」模式的两个必填项。DBL 刻意分开存：它们对应 Cloudflare 面板里的
+      // 「公共主机名」与「服务地址」两处，改一个就必须改另一个，界面上要挨着摆。
+      const [provider, setProvider] = useState('quick');
+      const [publicHost, setPublicHost] = useState('');
+      const [publicPort, setPublicPort] = useState('');
+      // 重启后自动开启：默认打开 —— 用户要的就是「重启后不用回桌面点一下」。
+      const [autoStart, setAutoStart] = useState(true);
       const alive = useRef(true);
 
       useEffect(() => () => { alive.current = false; }, []);
@@ -237,6 +259,11 @@ window.__ModuleLoader__.load({
           // 「选了公网页签，界面还是局域网」。
           if (next.enabled && next.mode) setMode(next.mode);
           if (next.selectedIp) setIp(next.selectedIp);
+          // 偏好回填：这几个值来自磁盘，刷新时应以宿主为准（否则用户会看到自己上次的输入被吞掉）。
+          if (typeof next.autoStart === 'boolean') setAutoStart(next.autoStart);
+          if (next.publicProvider) setProvider(next.publicProvider);
+          if (next.publicHost) setPublicHost(next.publicHost);
+          if (next.publicPort) setPublicPort(String(next.publicPort));
         } catch (err) {
           if (alive.current) setError(err instanceof Error ? err.message : String(err));
         }
@@ -268,15 +295,15 @@ window.__ModuleLoader__.load({
       }, []);
 
       const copyLink = useCallback(async () => {
-        if (!state?.authUrl) return;
+        if (!state?.entryUrl) return;
         try {
-          await navigator.clipboard.writeText(state.authUrl);
+          await navigator.clipboard.writeText(state.entryUrl);
           setCopied(true);
           setTimeout(() => { if (alive.current) setCopied(false); }, 1600);
         } catch {
           setCopied(false);
         }
-      }, [state?.authUrl]);
+      }, [state?.entryUrl]);
 
       // 连状态都取不到（宿主半没加载）时，别把界面装成「未开启，一切正常」。
       const hostUnreachable = state === null && error !== null;
@@ -299,7 +326,20 @@ window.__ModuleLoader__.load({
       // 宿主的 start() 本身就会先停掉旧会话，所以「切换」一次点击即可。
       const toggleAction = () => {
         const wantsDisable = running && !pendingSwitch;
-        return void act(wantsDisable ? 'disable' : 'enable', wantsDisable ? undefined : { mode, ip });
+        if (wantsDisable) {
+          void act('disable');
+          return;
+        }
+        void act('enable', {
+          mode,
+          ip,
+          autoStart,
+          // 公网下把「地址来源」一并带上：quick = 随机域名（每次开启都换）；
+          // stable = 自有域名（固定主机名 + 固定本地端口，重启后二维码仍然有效）。
+          publicProvider: mode === 'public' ? provider : undefined,
+          publicHost: mode === 'public' && provider === 'stable' ? publicHost : undefined,
+          publicPort: mode === 'public' && provider === 'stable' ? Number(publicPort) : undefined,
+        });
       };
 
       const children = [];
@@ -363,6 +403,63 @@ window.__ModuleLoader__.load({
         }, `当前正以「${MODE_LABEL[activeMode]}」模式连接。点下面的「${toggleLabel}」即可直接切换，不必先手动关闭。`));
       }
 
+      // 公网「地址来源」：这一项**直接决定重启后旧二维码还能不能用**。
+      // 快速隧道的域名每次开启都换（免费隧道没有复用域名的办法）；自有域名配合常驻的
+      // 命名隧道才是固定的，所以把它摆在这么前面。
+      if (mode === 'public') {
+        children.push(h('div', { key: 'provider', style: { display: 'flex', gap: 10, flexWrap: 'wrap' } }, [
+          h('button', {
+            key: 'quick',
+            type: 'button',
+            style: chip(provider === 'quick'),
+            disabled: busy || starting,
+            onClick: () => setProvider('quick'),
+          }, '快速隧道（随机域名，重启要重扫）'),
+          h('button', {
+            key: 'stable',
+            type: 'button',
+            style: chip(provider === 'stable'),
+            disabled: busy || starting,
+            onClick: () => setProvider('stable'),
+          }, '自有域名（固定，重启不用重扫）'),
+        ]));
+
+        if (provider === 'stable') {
+          const row = (key, label, input) => h('label', {
+            key,
+            style: { display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, color: C.muted },
+          }, [h('span', { key: 'l', style: { minWidth: 68 } }, label), input]);
+
+          children.push(h('div', {
+            key: 'stable-config',
+            style: { display: 'flex', flexDirection: 'column', gap: 8 },
+          }, [
+            row('host', '公网域名', h('input', {
+              key: 'i',
+              value: publicHost,
+              placeholder: 'dsh.example.com',
+              disabled: busy || starting,
+              onChange: (event) => setPublicHost(event.target.value),
+              style: fieldInput(),
+            })),
+            row('port', '本地端口', h('input', {
+              key: 'i',
+              value: publicPort,
+              placeholder: '47823',
+              inputMode: 'numeric',
+              disabled: busy || starting,
+              onChange: (event) => setPublicPort(event.target.value.replace(/[^\d]/g, '')),
+              style: fieldInput(),
+            })),
+            h('div', { key: 'hint', style: { fontSize: 12, color: C.muted, lineHeight: '19px' } },
+              `Cloudflare 面板里：「公共主机名」填 ${publicHost || '你的域名'}，`
+              + `「服务地址」填 http://localhost:${publicPort || '上面这个端口'}。`
+              + '隧道用 cloudflared 以服务方式常驻（cloudflared service install <token>），'
+              + '插件不托管它、也不保存你的 Cloudflare 凭据。这样 DSH 重启后这条二维码仍然有效。'),
+          ]));
+        }
+      }
+
       // 局域网网卡选择
       if (mode === 'lan' && lanIps.length > 1) {
         const options = lanIps.map((address) => h('option', { key: address, value: address }, address));
@@ -387,6 +484,21 @@ window.__ModuleLoader__.load({
           }, options),
         ]));
       }
+
+      // 重启后自动开启：这是「不用回桌面点一下」的实现；显式关闭会把它一起关掉。
+      children.push(h('label', {
+        key: 'autostart',
+        style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: C.muted },
+      }, [
+        h('input', {
+          key: 'cb',
+          type: 'checkbox',
+          checked: autoStart,
+          disabled: busy || starting,
+          onChange: (event) => setAutoStart(event.target.checked),
+        }),
+        h('span', { key: 't' }, 'DSH 重启后自动按这次的形态开启（模式与端口都会记住）'),
+      ]));
 
       // 主操作
       const actions = [
@@ -444,7 +556,9 @@ window.__ModuleLoader__.load({
             style: { flex: '1 1 260px', minWidth: 240, display: 'flex', flexDirection: 'column', gap: 10 },
           }, [
             h('div', { key: 'mode', style: { fontSize: 13, color: C.text, fontWeight: 600 } },
-              (state.mode === 'public' ? '公网隧道（cloudflared）' : '局域网直连')
+              (state.mode === 'public'
+                ? (state.publicProvider === 'stable' ? '公网 · 自有域名（固定）' : '公网隧道（cloudflared 快速隧道）')
+                : '局域网直连')
               + (pendingSwitch ? `　·　已选择「${MODE_LABEL[mode]}」，待切换` : '')),
             h('div', {
               key: 'url',
@@ -458,14 +572,28 @@ window.__ModuleLoader__.load({
                 padding: '8px 10px',
                 lineHeight: '18px',
               },
-            }, state.authUrl),
-            h('div', { key: 'copy', style: { display: 'flex', gap: 10 } }, [
+            }, state.entryUrl ?? ''),
+            h('div', {
+              key: 'stability',
+              style: { fontSize: 12, color: state.entryStable ? C.success : C.warn, lineHeight: '18px' },
+            }, state.entryStable
+              ? '这条地址是长期入口：DSH 重启后仍然有效，手机不用重扫。'
+              : '注意：快速隧道的域名每次开启都会换，重启后这条地址会失效（改用「自有域名」可避免）。'),
+            h('div', { key: 'copy', style: { display: 'flex', gap: 10, flexWrap: 'wrap' } }, [
               h('button', {
                 key: 'btn',
                 type: 'button',
                 style: ghostButton(),
                 onClick: () => void copyLink(),
               }, copied ? '已复制' : '复制链接'),
+              h('button', {
+                key: 'rotate',
+                type: 'button',
+                style: ghostButton(),
+                disabled: busy,
+                // 长期入口不随重启轮换，所以必须给一个显式的作废手段：换钥匙后旧链接/旧二维码立刻失效。
+                onClick: () => void act('rotate-entry'),
+              }, '重置长期入口'),
             ]),
             h('div', { key: 'tip', style: { fontSize: 12, color: C.muted, lineHeight: '18px' } },
               state.mode === 'public'
@@ -492,6 +620,8 @@ window.__ModuleLoader__.load({
         h('div', { key: 'b' }, '· 手机首次扫码由 DSH 校验令牌并下发会话 cookie，之后凭 cookie 访问；代理不接触 DSH 的鉴权判断。'),
         h('div', { key: 'c' }, '· 公网模式依赖 cloudflared 快速隧道（首次会自动下载）；微信内置浏览器可直接打开该链接。'),
         h('div', { key: 'd' }, '· 手机端登录票失效时（微信回收网页、清缓存、从聊天再次打开都会这样），会显示「重新认证」页：点一下即可恢复，不用扫第二次码。'),
+        h('div', { key: 'e' }, '· 二维码里是「长期入口」：只要主机名与端口不变（局域网 / 自有域名），DSH 重启后同一条链接仍然有效；快速隧道每次换域名，所以做不到。'),
+        h('div', { key: 'f' }, state?.statePath ? `· 偏好与长期密钥存在 ${state.statePath}；换电脑或想彻底作废旧链接，点上面的「重置长期入口」。` : ''),
       ]));
 
       return h('div', {

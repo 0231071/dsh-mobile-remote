@@ -21,19 +21,21 @@
  */
 
 import { appendFileSync, mkdirSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
 
 import { listLanIPv4 } from './net.js';
+import { ensureSecrets, loadPrefs, mobileRemoteDir, prefsPath, randomKey, savePrefs } from './prefs.js';
 import { RewriteProxy } from './proxy.js';
 import { qrPngDataUrl } from './qr.js';
 import {
+  REDEEM_PATH,
   RELAY_PATH,
-  mintBootSecret,
+  bootCookieSetCookie,
+  bootSecretMatches,
   relayPageHtml,
   requestHasBootTicket,
+  tryingCookieSetCookie,
 } from './recover.js';
-import { ensureCloudflared, startQuickTunnel, waitForPublicReady } from './tunnel.js';
+import { ensureCloudflared, probeDirectFetch, startQuickTunnel, waitForPublicReady } from './tunnel.js';
 
 /**
  * 激活轨迹：往 `$DSH_HOME/mobile-remote/activation.log` 追加一行。
@@ -45,10 +47,9 @@ import { ensureCloudflared, startQuickTunnel, waitForPublicReady } from './tunne
  */
 function trace(line) {
   try {
-    const dir = process.env.DSH_MOBILE_REMOTE_TRACE_DIR
-      ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'mobile-remote');
+    const dir = process.env.DSH_MOBILE_REMOTE_TRACE_DIR ?? mobileRemoteDir();
     mkdirSync(dir, { recursive: true });
-    appendFileSync(join(dir, 'activation.log'), `${new Date().toISOString()} ${line}\n`);
+    appendFileSync(`${dir}/activation.log`, `${new Date().toISOString()} ${line}\n`);
   } catch {
     /* 跟踪失败不影响功能 */
   }
@@ -117,6 +118,19 @@ export const inject = ['webServer', 'connection'];
  * 任何真实请求都匹配不上（当年就是这么 404 的）。
  */
 const ROUTE_PREFIX = '/mobile-remote';
+
+/**
+ * 长期入口：二维码里印的就是它。
+ *
+ * 与 `/redeem`（凭恢复票换票）的区别：`enter` 凭的是**持久化**的长期密钥，所以
+ * 「重启后旧二维码仍然有效」；`redeem` 凭的是那台手机浏览器里的 HttpOnly 恢复票，
+ * 所以能做到「401 之后自动恢复、连按钮都不用点」。两条路最后都落到同一个动作：
+ * 302 到 `ctx.connection.authenticatedUrl(...)`，由 DSH 自己下发会话 cookie。
+ */
+const ENTER_PATH = '/mobile-remote/enter';
+
+/** 健康检查：只用于证明「域名 → 隧道 → 本机代理 → DSH」这条链通，不返回任何状态。 */
+const HEALTH_PATH = '/mobile-remote/health';
 
 /** 请求体上限（enable 请求只有几个字段）。 */
 const MAX_BODY_BYTES = 64 * 1024;
@@ -198,8 +212,24 @@ export function apply(ctx) {
     targetPort: null,
     /** 不含 token 的基地址（用于展示） */
     baseUrl: null,
-    /** 含一次性 token 的完整地址（二维码内容） */
+    /** 含当前进程令牌的入口地址（只用于诊断；它会随 DSH 重启而变） */
     authUrl: null,
+    /**
+     * **二维码里的地址**：插件自己的长期入口 `/mobile-remote/enter?k=…`。
+     * 它与 DSH 的进程令牌无关，只要「主机名 + 端口 + 长期密钥」不变，重启后依然有效。
+     */
+    entryUrl: null,
+    /** 长期入口是否真的能跨重启（取决于公网是否用了自有域名） */
+    entryStable: false,
+    /** 公网地址来源：quick（随机域名，每次开启都换）/ stable（自有域名，固定不变） */
+    publicProvider: 'quick',
+    /** 自有域名模式下固定的公网主机名与本地端口（面板里要按这个填） */
+    publicHost: null,
+    publicPort: null,
+    /** 重启后是否自动开启（上次是开的就记住） */
+    autoStart: false,
+    /** 状态文件路径（设置页直接显示，便于排查） */
+    statePath: prefsPath(),
     publicUrl: null,
     provider: null,
     /** PNG data URL */
@@ -214,13 +244,24 @@ export function apply(ctx) {
   let proxy = null;
   let tunnel = null;
   /**
-   * 引导票（详见 lib/recover.js）：
-   * - **每次开启连接重新生成**，关闭/切换/卸载即作废 —— 与二维码同寿命；
-   * - 只往 `state` 里放「有没有」，密钥本身绝不进 JSON、不进日志、不出现在任何响应体里，
-   *   它只以 HttpOnly cookie 的形式回到那台手机的浏览器里。
-   * @type {{ secret: string } | null}
+   * 跨重启的偏好与两把钥匙（详见 lib/prefs.js）：
+   * - `entryKey`：长期入口密钥，二维码里带的就是它；**不随重启轮换**（要换就在设置页重置）；
+   * - `bootSecret`：恢复票密钥，让手机端 cookie 失效后的自愈在重启后仍然有效。
+   * 两把钥匙都只存在于状态文件与 HttpOnly cookie 里，**不进 JSON、不进日志**。
    */
-  let bootTicket = null;
+  let prefs = loadPrefs();
+  {
+    const ensured = ensureSecrets(prefs);
+    prefs = ensured.prefs;
+    if (ensured.changed && !savePrefs(prefs)) {
+      trace('state.json 写不进去（钥匙只存在于本次进程内）');
+    }
+  }
+  state.autoStart = prefs.autoStart;
+  state.publicProvider = prefs.public.provider;
+  state.publicHost = prefs.public.host;
+  state.publicPort = prefs.public.port;
+  trace(`prefs loaded: autoStart=${prefs.autoStart} mode=${prefs.mode} provider=${prefs.public.provider} entryKey=${prefs.entryKey === null ? 'none' : 'present'}`);
   /** 串行化 enable/disable，避免并发点按把代理和隧道搅乱。 */
   let queue = Promise.resolve();
   /**
@@ -255,13 +296,15 @@ export function apply(ctx) {
       await proxy.stop();
       proxy = null;
     }
-    // 恢复票随连接一起作废：不留任何「关掉还能换票」的窗口。
-    bootTicket = null;
+    // 注意：两把长期钥匙（entryKey / bootSecret）**不在这里清掉**。
+    // 它们本来就要跨重启活着，否则「手机端零操作恢复」和「旧二维码继续有效」都不成立。
     state.phase = 'off';
     state.enabled = false;
     state.qrPng = null;
     state.baseUrl = null;
     state.authUrl = null;
+    state.entryUrl = null;
+    state.entryStable = false;
     state.publicUrl = null;
     state.provider = null;
     state.proxyPort = null;
@@ -271,37 +314,119 @@ export function apply(ctx) {
     touch();
   }
 
-  async function start({ mode, ip, port }) {
+  /**
+   * 开启（重启后的自动开启也走这里）。
+   *
+   * 端口与地址的取法直接决定「重启后旧二维码还能不能用」：
+   *  - 局域网：优先复用上次的端口（`prefs.lan.port`），成功则入口 URL 与上次逐字节一致；
+   *    端口被别的程序占走时回落到随机端口并把新端口写回偏好（此时旧码失效，属如实降级）。
+   *  - 公网 quick：域名每次随机，本来就不可能稳定。
+   *  - 公网 stable（自有域名 + 命名隧道）：端口必须**固定**，因为 Cloudflare 面板里配的
+   *    服务地址就是 `http://localhost:<端口>`；端口被占直接报错，绝不偷偷换一个 ——
+   *    换了只会让面板那条映射指向空气，比报错更难查。
+   *
+   * @param {{ mode?: string, ip?: string, port?: number, publicProvider?: string,
+   *   publicHost?: string, publicPort?: number }} [options]
+   */
+  async function start(options = {}) {
+    const mode = options.mode === 'public' ? 'public' : 'lan';
+    const provider = mode === 'public' && (options.publicProvider ?? prefs.public.provider) === 'stable'
+      ? 'stable'
+      : 'quick';
+    const publicHost = mode === 'public' && provider === 'stable'
+      ? (options.publicHost ?? prefs.public.host)
+      : null;
+    const publicPort = mode === 'public' && provider === 'stable'
+      ? (Number.isInteger(options.publicPort) && options.publicPort > 0 ? options.publicPort : prefs.public.port)
+      : null;
+
     const targetPort = ctx.webServer.port;
-    if (!targetPort) throw new Error('DSH Web 端口尚未就绪');
+    if (!targetPort) {
+      // 启动期的「前置条件不满足」也必须是 error 态：只 throw 不置位的话，
+      // 界面会永远停在「启动中…」（enable 是异步触发的，没人接住这个状态）。
+      state.phase = 'error';
+      state.lastError = 'DSH Web 端口尚未就绪';
+      state.message = '无法开启：DSH Web 端口尚未就绪';
+      touch();
+      throw new Error('DSH Web 端口尚未就绪');
+    }
+    if (mode === 'public' && provider === 'stable' && (publicHost === null || publicPort === null)) {
+      state.phase = 'error';
+      state.lastError = '公网固定地址模式下必须填写域名与本地端口（Cloudflare 面板的服务地址要对上这个端口）';
+      state.message = '无法开启：公网固定地址配置不完整';
+      touch();
+      throw new Error(state.lastError);
+    }
 
     await stop('正在重新建立连接');
 
     state.mode = mode;
     state.phase = 'starting';
     state.targetPort = targetPort;
-    state.message = mode === 'public' ? '正在建立公网隧道…' : '正在启动局域网代理…';
+    if (mode === 'public') state.publicProvider = provider;
+    state.publicHost = publicHost ?? state.publicHost;
+    state.publicPort = publicPort ?? state.publicPort;
+    state.message = mode === 'lan'
+      ? '正在启动局域网代理…'
+      : provider === 'stable' ? '正在接通自有域名…' : '正在建立公网隧道…';
     touch();
 
-    // 每次开启连接都换一张新的恢复票：它与二维码同寿命，关闭/切换即作废。
-    bootTicket = { secret: mintBootSecret() };
-    trace('boot ticket minted for this session');
-    const instance = new RewriteProxy({ targetPort, log, boot: bootTicket });
+    // 恢复票用**持久化**的密钥：手机浏览器里那张票跨重启依然有效，才能做到「零操作恢复」。
+    const instance = new RewriteProxy({ targetPort, log, boot: { secret: prefs.bootSecret } });
+
+    // 端口：lan 允许回落，stable 必须固定。
+    const desiredPort = mode === 'lan'
+      ? (Number.isInteger(options.port) && options.port > 0 ? options.port : prefs.lan.port)
+      : (provider === 'stable' ? publicPort : (Number.isInteger(options.port) && options.port > 0 ? options.port : 0));
     try {
-      await instance.start({ port: Number.isInteger(port) && port > 0 ? port : 0 });
+      await instance.start({ port: desiredPort ?? 0 });
     } catch (error) {
-      state.phase = 'error';
-      state.lastError = `代理端口监听失败：${error.message}`;
-      state.message = '无法监听代理端口';
-      touch();
-      throw error;
+      if (mode === 'lan' && desiredPort) {
+        // 上次那个端口被别的程序占走了：换随机端口继续用，别让「重启后自动开启」卡死在这里。
+        trace(`局域网端口 ${desiredPort} 不可用，回落到随机端口：${error.message}`);
+        await instance.start({ port: 0 });
+      } else {
+        state.phase = 'error';
+        state.lastError = `代理端口监听失败：${error.message}`
+          + (provider === 'stable' ? `（固定端口 ${desiredPort} 被占用：Cloudflare 面板的服务地址就指着它，不能换端口）` : '');
+        state.message = '无法监听代理端口';
+        touch();
+        throw error;
+      }
     }
     proxy = instance;
     state.proxyPort = instance.port;
 
     let base;
     try {
-      if (mode === 'public') {
+      if (mode === 'public' && provider === 'stable') {
+        // 自有域名模式：隧道由用户以服务方式自己跑（cloudflared 指向本机固定端口），
+        // 插件**不持有任何 Cloudflare 凭据**，也不托管那个进程 —— 它比我们更该独立存活。
+        state.provider = 'external';
+        state.publicUrl = `https://${publicHost}`;
+        base = state.publicUrl;
+        const expected = `http://localhost:${instance.port}`;
+        state.message = `请确认 Cloudflare 隧道把 ${publicHost} 指到 ${expected}；正在探测…`;
+        void (async () => {
+          const ready = await waitForPublicReady(base, {
+            log,
+            timeoutMs: 60_000,
+            signal: lifecycle.signal,
+            // 自有域名不走「云端边缘回源」那套试探（那是给 trycloudflare 临时域名的）；
+            // 直接打一个插件自己的健康检查，它只证明「域名 → 隧道 → 本机代理 → DSH」这条路通。
+            probeDirect: (url) => probeDirectFetch(`${url}/mobile-remote/health`, log, lifecycle.signal),
+            probeEdge: async () => ({ ok: false, error: '自有域名模式不做边缘回源探针' }),
+          });
+          if (proxy !== instance || lifecycle.signal.aborted) return;
+          const verdict = publicReadinessMessage(ready);
+          state.message = verdict.ready
+            ? '自有域名已接通 —— 重启后这条二维码仍然有效。'
+            : `域名 ${publicHost} 暂未确认可达：${ready.error ?? '未知原因'}`
+              + `（隧道服务在跑吗？面板里的服务地址是不是 ${expected}）`;
+          state.lastError = verdict.ready ? null : state.message;
+          touch();
+        })();
+      } else if (mode === 'public') {
         const binPath = await ensureCloudflared(log, lifecycle.signal);
         const active = await startQuickTunnel({ binPath, port: instance.port, log, signal: lifecycle.signal });
         tunnel = active;
@@ -351,20 +476,23 @@ export function apply(ctx) {
         const ips = safeLanIps();
         state.lanIps = ips;
         if (ips.length === 0) throw new Error('未找到可用的局域网 IPv4，请改用公网连接');
-        const selected = ip && ips.includes(ip) ? ip : ips[0];
+        const selected = options.ip && ips.includes(options.ip) ? options.ip : ips[0];
         state.selectedIp = selected;
         base = `http://${selected}:${instance.port}`;
-        state.message = '手机需与电脑在同一 Wi-Fi 下扫码；链接含登录令牌，请勿分享。';
+        state.message = '手机需与电脑在同一 Wi-Fi 下扫码；链接含长期入口密钥，请勿分享。';
       }
 
-      // 用官方 Connection 生成带 token 的入口地址：token 由 DSH 自己校验并下发
-      // 会话 cookie，业务鉴权始终在 DSH 里。插件唯一持有的秘密是**自己签发的恢复票**
-      // （上面 mintBootSecret()，仅用于在 DSH cookie 失效后重新换一次票），
-      // 它不参与 DSH 的鉴权判断，也无法伪造 DSH 的会话 cookie。
+      // 两条地址各有分工，别再混用：
+      //  - `authUrl`：DSH 自己的「令牌 URL」，用**当前进程**的令牌拼成，重启即失效 —— 只作诊断；
+      //  - `entryUrl`：二维码里印的那个，含插件自己的长期密钥，**到请求那一刻才换票** —— 重启后仍有效。
       const authUrl = ctx.connection.authenticatedUrl(`${base}/`);
+      const entryUrl = `${base}${ENTER_PATH}?k=${prefs.entryKey}`;
       state.baseUrl = base;
       state.authUrl = authUrl;
-      state.qrPng = qrPngDataUrl(authUrl, { scale: 6, margin: 3 });
+      state.entryUrl = entryUrl;
+      // 公网 quick 模式的域名每次开启都换，谈不上稳定；其余两种模式入口是稳定的。
+      state.entryStable = mode === 'lan' || provider === 'stable';
+      state.qrPng = qrPngDataUrl(entryUrl, { scale: 6, margin: 3 });
       state.enabled = true;
       state.phase = 'on';
     } catch (error) {
@@ -377,7 +505,19 @@ export function apply(ctx) {
     }
 
     touch();
-    log(`已开启（${mode}）：${state.baseUrl}`);
+    // 记住这次成功的形态：重启后按它原样拉起，并让入口 URL 与这次逐字节一致。
+    prefs.mode = mode;
+    prefs.lan = { ip: state.selectedIp ?? prefs.lan.ip, port: state.proxyPort };
+    if (mode === 'public') {
+      prefs.public = {
+        provider,
+        host: provider === 'stable' ? publicHost : prefs.public.host,
+        port: provider === 'stable' ? publicPort : prefs.public.port,
+      };
+    }
+    if (!savePrefs(prefs)) trace('已开启，但 state.json 写不进去：重启后无法自动开启');
+    state.autoStart = prefs.autoStart;
+    log(`已开启（${mode}）：${state.baseUrl}（入口${state.entryStable ? '跨重启有效' : '会随隧道域名变化'}）`);
   }
 
   /** 与官方 /api 路由完全同一套信任判定。 */
@@ -414,38 +554,84 @@ export function apply(ctx) {
   }
 
   /**
-   * 换票：拿着有效的恢复票，换回一条带 token 的入口地址。
+   * 换票（凭恢复票）：给「这台手机曾经登录过、但现在 cookie 失效了」那条路用。
    *
-   * 为什么能省掉第二次扫码：DSH 的 token 是**进程级常量**（不是一次性的），
+   * 为什么能省掉第二次扫码：DSH 的令牌是**进程级常量**（不是一次性的），
    * 所以 `ctx.connection.authenticatedUrl()` 随时可以再拼一次，由 DSH 自己 303 + 下发 cookie。
-   * 前提是「这台手机确实曾经过认证」——这就是恢复票的作用。
+   *
+   * 顺带发一个 60 秒的「刚试过一次」标记：换完票如果 DSH 仍然 401（典型是电脑时钟被回拨），
+   * 代理那边的自动恢复就不会无限重定向，而是落到中转页把话说清楚。
    *
    * @param {import('node:http').IncomingMessage} request
    * @param {import('node:http').ServerResponse} response
    */
   function redeem(request, response) {
-    if (state.phase !== 'on' || typeof state.authUrl !== 'string' || bootTicket === null) {
+    if (state.phase !== 'on' || typeof state.authUrl !== 'string') {
       sendRelayPage(response, {
-        note: `手机连接现在没在运行（${state.message}）。请到桌面端「设置 → 手机连接」重新开启并扫码。`,
+        note: `手机连接现在没在运行（${state.message}）。请到桌面端「设置 → 手机连接」开启后再进。`,
         redeemable: false,
       });
       return;
     }
-    if (!requestHasBootTicket(request.headers.cookie, bootTicket.secret)) {
+    if (!requestHasBootTicket(request.headers.cookie, prefs.bootSecret)) {
       sendRelayPage(response, {
-        note: '这台手机上的「恢复票」也不在了（微信清过缓存、换过浏览器，或连接重开过），只能重新扫一次桌面端的二维码。',
+        note: '这台手机上的「恢复票」不在（微信清过缓存、换过浏览器），请直接打开长期入口链接；链接也丢了就重新扫一次二维码。',
         redeemable: false,
       });
       return;
     }
-    // 只把带 token 的地址交给持票者；不写日志、不回显，避免 token 进日志/截屏。
+    // 只把带令牌的地址交给持票者；不写日志、不回显，避免令牌进日志/截屏。
     response.writeHead(302, {
       location: state.authUrl,
       'cache-control': 'no-store',
       'referrer-policy': 'no-referrer',
+      'set-cookie': tryingCookieSetCookie(),
     });
     response.end();
     log('恢复票校验通过：已重新下发入口地址（手机端无需扫码）');
+  }
+
+  /**
+   * 长期入口（二维码里的那个地址）。
+   *
+   * 与 `/redeem` 同一个归宿，但凭据不同：这里凭的是**持久化**的长期密钥，
+   * 所以它能跨 DSH 重启仍然有效 —— 这正是「重启后旧二维码不用换」的实现方式。
+   * 校验用定时安全比较；密钥错了只回一行文本，**不给中转页**（那会暗示这里有东西可拿）。
+   *
+   * @param {URL} url
+   * @param {import('node:http').ServerResponse} response
+   */
+  function enter(url, response) {
+    const key = url.searchParams.get('k') ?? '';
+    if (prefs.entryKey === null || !bootSecretMatches(key, prefs.entryKey)) {
+      response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+      response.end('长期入口密钥无效。请在桌面端「设置 → 手机连接」里重新出码，或点「重置长期入口」。\n');
+      return;
+    }
+    if (state.phase !== 'on' || typeof state.authUrl !== 'string') {
+      response.writeHead(503, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+      response.end(`手机连接当前没在运行（${state.message}）。请在桌面端开启后再试。\n`);
+      return;
+    }
+    // 顺手补一张新的恢复票：从长期入口进来的人，天然就该拿到自动恢复的能力。
+    response.writeHead(302, {
+      location: state.authUrl,
+      'cache-control': 'no-store',
+      'referrer-policy': 'no-referrer',
+      'set-cookie': bootCookieSetCookie(prefs.bootSecret),
+    });
+    response.end();
+    log('长期入口命中：已下发当前令牌对应的入口地址');
+  }
+
+  function sendText(response, status, text) {
+    const body = Buffer.from(text, 'utf8');
+    response.writeHead(status, {
+      'content-type': 'text/plain; charset=utf-8',
+      'content-length': body.byteLength,
+      'cache-control': 'no-store',
+    });
+    response.end(body);
   }
 
   const route = {
@@ -455,7 +641,7 @@ export function apply(ctx) {
       const url = new URL(request.url ?? '/', 'http://dsh.invalid');
       const action = url.pathname.slice(ROUTE_PREFIX.length).replace(/^\/+|\/+$/g, '');
 
-      // ⚠️ 顺序是有意的：自愈入口排在 cookie 校验之前。
+      // ⚠️ 顺序是有意的：三个自愈/入口端点排在 cookie 校验**之前**。
       // 它们派上用场的时刻，恰恰是「手机没有 DSH cookie」的时刻。
       if (request.method === 'GET' && action === 'relay') {
         sendRelayPage(response);
@@ -463,6 +649,14 @@ export function apply(ctx) {
       }
       if (request.method === 'GET' && action === 'redeem') {
         redeem(request, response);
+        return;
+      }
+      if (request.method === 'GET' && action === 'enter') {
+        enter(url, response);
+        return;
+      }
+      if (request.method === 'GET' && action === 'health') {
+        sendText(response, 200, 'ok\n');
         return;
       }
 
@@ -473,9 +667,33 @@ export function apply(ctx) {
           sendJson(response, 200, { ...state, lanIps: safeLanIps() });
           return;
         }
+        if (request.method === 'POST' && action === 'rotate-entry') {
+          // 换钥匙 = 让所有旧二维码/旧链接立刻失效。这是长期入口唯一的重置手段，必须显式且留痕。
+          prefs.entryKey = randomKey();
+          const saved = savePrefs(prefs);
+          if (state.phase === 'on' && typeof state.authUrl === 'string') {
+            const entryUrl = `${state.baseUrl}${ENTER_PATH}?k=${prefs.entryKey}`;
+            state.entryUrl = entryUrl;
+            state.qrPng = qrPngDataUrl(entryUrl, { scale: 6, margin: 3 });
+          }
+          trace('entry key rotated');
+          touch();
+          sendJson(response, 200, { ...state, saved });
+          return;
+        }
         if (request.method === 'POST' && action === 'enable') {
           const body = await readJsonBody(request);
           const mode = body.mode === 'public' ? 'public' : 'lan';
+          // 「重启后自动开启」默认打开：用户要的就是重启后不用回桌面点一下。
+          if (typeof body.autoStart === 'boolean') {
+            prefs.autoStart = body.autoStart;
+            state.autoStart = body.autoStart;
+          }
+          if (mode === 'public' && body.publicProvider === 'stable') {
+            prefs.public.provider = 'stable';
+          } else if (mode === 'public') {
+            prefs.public.provider = 'quick';
+          }
           // 公网模式要下载 cloudflared（可能数分钟），绝不能把 HTTP 请求挂在那里：
           // 立刻置「启动中」并返回，前端改为轮询 /status。
           state.mode = mode;
@@ -488,14 +706,30 @@ export function apply(ctx) {
               mode,
               ip: typeof body.ip === 'string' ? body.ip : undefined,
               port: Number(body.port),
+              publicProvider: body.publicProvider === 'stable' ? 'stable' : undefined,
+              publicHost: typeof body.publicHost === 'string' ? body.publicHost : undefined,
+              publicPort: Number(body.publicPort),
             }),
           ).catch((error) => {
-            warn(`开启失败：${error instanceof Error ? error.message : String(error)}`);
+            const message = error instanceof Error ? error.message : String(error);
+            warn(`开启失败：${message}`);
+            // 兜底：任何在置 error 之前就抛出去的情况，都不允许把界面留在「启动中…」。
+            if (state.phase === 'starting') {
+              state.phase = 'error';
+              state.lastError = message;
+              state.message = '开启失败，可改用另一种模式重试';
+              touch();
+            }
           });
           sendJson(response, 200, { ...state });
           return;
         }
         if (request.method === 'POST' && action === 'disable') {
+          // 显式关闭 = 明确表示「下次别再自己开」。这是与「重启后自动开启」相反方向的意图，
+          // 必须落盘，否则用户关掉之后每次启动都会被重新打开。
+          prefs.autoStart = false;
+          state.autoStart = false;
+          savePrefs(prefs);
           await serialize(() => stop('已关闭手机连接'));
           sendJson(response, 200, { ...state });
           return;
@@ -512,6 +746,60 @@ export function apply(ctx) {
   ctx.effect(() => ctx.webServer.register(route), 'dsh-mobile-remote: /mobile-remote 路由');
   trace('route registered at /mobile-remote (prefix, no trailing slash)');
   announce();
+
+  /**
+   * 重启后自动开启。
+   *
+   * 三条纪律，每一条都对应一次「自动开启反而更烦」的失败：
+   *  1. **绝不阻塞 apply()**：这里只是排一个后台任务。开启要建代理/起隧道，慢的时候几十秒，
+   *     一旦挡住激活，界面会变成「有标签页、接口全 404」那种假死现场。
+   *  2. **等宿主 Web 端口就绪**：`ctx.webServer.port` 在组合期还可能为空，直接开会抛
+   *     「DSH Web 端口尚未就绪」——那是启动顺序问题，不是用户配错了，所以要轮询等待。
+   *  3. **失败只留痕、不弹错**：自动开启失败（端口被占、隧道没起来）不该打断用户手上的事，
+   *     状态里如实显示 error，用户点一下就能重试。
+   */
+  async function autoStartAfterRestart() {
+    if (!prefs.autoStart) {
+      trace('auto-start off（上次是关闭状态）');
+      return;
+    }
+    const deadline = Date.now() + 30_000;
+    while (!ctx.webServer.port && Date.now() < deadline && !lifecycle.signal.aborted) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    if (lifecycle.signal.aborted) return;
+    if (!ctx.webServer.port) {
+      trace('auto-start skipped: DSH Web 端口 30s 内未就绪');
+      return;
+    }
+    const target = {
+      mode: prefs.mode,
+      ip: prefs.lan.ip ?? undefined,
+      port: prefs.lan.port ?? undefined,
+      publicProvider: prefs.public.provider,
+      publicHost: prefs.public.host ?? undefined,
+      publicPort: prefs.public.port ?? undefined,
+    };
+    trace(`auto-start: 按上次形态恢复 mode=${target.mode} port=${target.port} provider=${target.publicProvider}`);
+    state.mode = target.mode;
+    state.phase = 'starting';
+    state.message = '正在按上次的形态自动开启…';
+    touch();
+    try {
+      await serialize(() => start(target));
+      trace('auto-start: ok');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      trace(`auto-start failed: ${message}`);
+      warn(`自动开启失败：${message}`);
+      state.phase = 'error';
+      state.lastError = message;
+      state.message = '自动开启失败，可在设置里手动开启';
+      touch();
+    }
+  }
+
+  void autoStartAfterRestart();
 
   ctx.effect(
     () => () => {

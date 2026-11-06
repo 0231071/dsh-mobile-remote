@@ -409,4 +409,43 @@ test('代理：没有恢复票配置时，401 仍换成中转页（只是按钮�
   }
 });
 
+test('代理：持恢复票的文档 401 自动换票（302），且不会无限重定向', async () => {
+  const origin = await startDshLike();
+  const proxy = new RewriteProxy({ targetPort: origin.port, boot: { secret: 'boot-secret' } });
+  const proxyPort = await proxy.start();
+  try {
+    // ① 持有效恢复票 → 直接 302 到换票入口：用户连按钮都不用点（DSH 重启后的零操作恢复）
+    const auto = await viaProxy(proxyPort, '/', {
+      host: 'abc.trycloudflare.com',
+      cookie: 'dsh-mobile-boot=boot-secret',
+      headers: { accept: 'text/html', 'sec-fetch-dest': 'document' },
+    });
+    assert.equal(auto.status, 302, `持恢复票时应自动换票，实际 ${auto.status}`);
+    assert.equal(auto.headers.location, '/mobile-remote/redeem');
+    assert.equal(auto.body, '', '重定向不该带正文');
+
+    // ② 恢复票不对 → 不能拿它换票，只能是中转页
+    const wrong = await viaProxy(proxyPort, '/', {
+      host: 'abc.trycloudflare.com',
+      cookie: 'dsh-mobile-boot=nope',
+      headers: { accept: 'text/html' },
+    });
+    assert.equal(wrong.status, 401);
+    assert.match(wrong.body, /重新认证/);
+
+    // ③ 刚试过一次（换完仍 401，例如电脑时钟被回拨）→ 不再自动换，落到中转页把话说清楚。
+    //    没有这条，浏览器会在 `/` 与 `/redeem` 之间转到自己报错为止。
+    const loopGuard = await viaProxy(proxyPort, '/', {
+      host: 'abc.trycloudflare.com',
+      cookie: 'dsh-mobile-boot=boot-secret; dsh-mobile-trying=1',
+      headers: { accept: 'text/html' },
+    });
+    assert.equal(loopGuard.status, 401, '重试窗口内必须停下来');
+    assert.match(loopGuard.body, /重新认证/);
+  } finally {
+    await proxy.stop();
+    await origin.close();
+  }
+});
+
 //#endregion

@@ -42,6 +42,16 @@ export const REDEEM_PATH = '/mobile-remote/redeem';
 export const BOOT_COOKIE_NAME = 'dsh-mobile-boot';
 
 /**
+ * 「刚刚试过一次换票」的短命标记（60 秒）。
+ *
+ * 为什么需要它：换票成功后如果 DSH 仍然回 401（典型是电脑时钟被回拨，`issuedAt > now`
+ * 让新票立刻失效），代理的自动恢复会变成「401 → 换票 → 401 → 换票」的无限重定向。
+ * 浏览器转二十来次就报错，而用户完全看不出发生了什么。有这个标记，自动恢复就只试一次，
+ * 再失败就落到中转页上把话说清楚。
+ */
+export const TRYING_COOKIE_NAME = 'dsh-mobile-trying';
+
+/**
  * 引导票有效期。刻意给足（7 天）：它真正的寿命由「连接是否还开着」决定
  * —— 关闭连接、切换模式、重启 DSH 都会换一张新票，手机也就再也用不上旧票。
  * 若比 DSH 的 30 天 cookie 短，就会出现「DSH 票还活着、恢复票先过期」的倒挂，
@@ -121,6 +131,20 @@ export function bootCookieSetCookie(secret, options = {}) {
     ? options.maxAgeSeconds
     : BOOT_COOKIE_MAX_AGE_SECONDS;
   return `${BOOT_COOKIE_NAME}=${secret}; Max-Age=${maxAge}; Path=/; HttpOnly; SameSite=Lax`;
+}
+
+/** 「刚试过一次换票」标记的 `Set-Cookie` 头值（60 秒后自动消失）。 */
+export function tryingCookieSetCookie() {
+  return `${TRYING_COOKIE_NAME}=1; Max-Age=60; Path=/; HttpOnly; SameSite=Lax`;
+}
+
+/**
+ * 这张请求是否处于「刚试过换票」的窗口里。
+ * @param {string | undefined} cookieHeader 原始 Cookie 头
+ * @returns {boolean}
+ */
+export function requestIsRetrying(cookieHeader) {
+  return cookieValue(cookieHeader, TRYING_COOKIE_NAME) === '1';
 }
 
 /** HTML 文本转义（中转页里的说明可能带外部字符串）。 */

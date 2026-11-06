@@ -28,7 +28,13 @@
 
 import net from 'node:net';
 
-import { bootCookieSetCookie, relayPageHtml } from './recover.js';
+import {
+  REDEEM_PATH,
+  bootCookieSetCookie,
+  relayPageHtml,
+  requestHasBootTicket,
+  requestIsRetrying,
+} from './recover.js';
 
 const MAX_HEAD_BYTES = 64 * 1024;
 
@@ -46,6 +52,27 @@ function isDocumentNavigation(requestText) {
   if (!/^(?:GET|POST)\s/.test(requestText)) return false;
   if (/(?:^|\r\n)sec-fetch-dest:\s*document\b/i.test(requestText)) return true;
   return /(?:^|\r\n)accept:[^\r\n]*text\/html/i.test(requestText);
+}
+
+/** 从**请求**头文本里取某个头的值（只用于 Cookie，够用即可）。 */
+function requestHeaderValue(requestText, name) {
+  const pattern = new RegExp(`(?:^|\\r\\n)${name}:\\s*([^\\r\\n]*)`, 'i');
+  const match = pattern.exec(requestText);
+  return match === null ? undefined : match[1].trim();
+}
+
+/** 组装「自动换票」的重定向响应（同源跳到换票入口）。 */
+function redeemRedirect() {
+  return Buffer.from([
+    'HTTP/1.1 302 Found',
+    `location: ${REDEEM_PATH}`,
+    'cache-control: no-store',
+    'referrer-policy: no-referrer',
+    'content-length: 0',
+    'connection: close',
+    '',
+    '',
+  ].join('\r\n'), 'latin1');
 }
 
 /** 从响应头文本里取状态码（取不到就给 0，调用方一律按「不处理」对待）。 */
@@ -318,12 +345,24 @@ export class RewriteProxy {
             return;
           }
 
-          // ② 文档被 401 掉：换成中转页（状态码仍是 401，语义不变）。
+          // ② 文档被 401 掉：
+          //    · 手机上还有本插件的恢复票、且不是「刚试过一次」→ 直接自动换票，
+          //      用户连按钮都不用点（这是「DSH 重启后手机端零操作恢复」的关键一环）；
+          //    · 否则给中转页（状态码仍是 401，语义不变）。
           if (documentRequest && !headRequest && status === 401) {
+            const cookieHeader = requestHeaderValue(requestText, 'cookie');
+            const canAutoRecover = this.boot !== null
+              && !requestIsRetrying(cookieHeader)
+              && requestHasBootTicket(cookieHeader, this.boot.secret);
             intercepted = true;
             upstream?.destroy();
-            client.end(relayResponse());
-            this.log('文档请求未认证：已换成「重新认证」中转页');
+            if (canAutoRecover) {
+              client.end(redeemRedirect());
+              this.log('文档请求未认证：持恢复票，已自动换票');
+            } else {
+              client.end(relayResponse());
+              this.log('文档请求未认证：已换成「重新认证」中转页');
+            }
             return;
           }
 

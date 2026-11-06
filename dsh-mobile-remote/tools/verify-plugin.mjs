@@ -215,24 +215,44 @@ async function main() {
     check('局域网模式进入 on', lanState?.phase === 'on', `phase=${lanState?.phase} msg=${lanState?.message}`);
     if (lanState?.phase !== 'on') throw new Error(`局域网模式未就绪：${lanState?.lastError ?? lanState?.message}`);
     check('状态里有二维码 PNG', typeof lanState.qrPng === 'string' && lanState.qrPng.startsWith('data:image/png;base64,'), '缺 qrPng');
-    check('状态里有带 token 的入口地址', typeof lanState.authUrl === 'string' && lanState.authUrl.includes('token='), `authUrl=${lanState.authUrl}`);
-    log(`   入口地址：${lanState.authUrl}`);
+    check('状态里有长期入口地址', typeof lanState.entryUrl === 'string' && lanState.entryUrl.includes('/mobile-remote/enter?k='),
+      `entryUrl=${lanState.entryUrl}`);
+    check('局域网模式的入口被标记为跨重启稳定', lanState.entryStable === true, `entryStable=${lanState.entryStable}`);
+    log(`   长期入口：${lanState.entryUrl}`);
     log(`   代理端口：${lanState.proxyPort} → 127.0.0.1:${lanState.targetPort}`);
 
-    // ⑥ 二维码内容必须等于 authUrl（等价于手机扫码）
+    // ⑥ 二维码内容必须等于长期入口（等价于手机扫码）
     const png = Buffer.from(lanState.qrPng.slice('data:image/png;base64,'.length), 'base64');
     const recovered = matrixFromPng(png);
     const scanned = decodeMatrix(recovered);
-    check('二维码解码结果 === authUrl', scanned.text === lanState.authUrl,
+    check('二维码解码结果 === 长期入口', scanned.text === lanState.entryUrl,
       `扫码得到 ${scanned.text}`);
     log(`   二维码：${recovered.size}×${recovered.size} 模块、纠错 ${scanned.ecLevel}、掩码 ${scanned.mask}`);
 
-    // ⑦ 像手机一样走代理完成令牌登录
+    // ⑦ 像手机一样：扫到的长期入口 → 302 到令牌地址 → 303 下发 cookie → 首页 200
     const phoneAuthority = `${lanState.selectedIp}:${lanState.proxyPort}`;
-    const phonePath = new URL(lanState.authUrl).pathname + new URL(lanState.authUrl).search;
-    const phoneFirst = await request(Number(lanState.proxyPort), phonePath, {
+    const entryPath = new URL(scanned.text).pathname + new URL(scanned.text).search;
+    const entered = await request(Number(lanState.proxyPort), entryPath, {
       host: phoneAuthority,
-      headers: { origin: `http://${phoneAuthority}` },
+      headers: { origin: `http://${phoneAuthority}`, accept: 'text/html' },
+    });
+    check('手机打开长期入口（经代理）→ 302 到令牌地址', entered.status === 302, `HTTP ${entered.status}`);
+    check('长期入口同时下发恢复票',
+      (entered.headers['set-cookie'] ?? []).some((c) => c.startsWith('dsh-mobile-boot=')),
+      JSON.stringify(entered.headers['set-cookie'] ?? []));
+
+    const tokenPath = (() => {
+      const location = entered.headers.location ?? '';
+      try {
+        const url = new URL(location);
+        return url.pathname + url.search;
+      } catch {
+        return location;
+      }
+    })();
+    const phoneFirst = await request(Number(lanState.proxyPort), tokenPath, {
+      host: phoneAuthority,
+      headers: { origin: `http://${phoneAuthority}`, accept: 'text/html' },
     });
     check('手机首跳（经代理）→ 303', phoneFirst.status === 303, `HTTP ${phoneFirst.status}`);
     const phoneCookie = (phoneFirst.headers['set-cookie'] ?? [])[0]?.split(';')[0];
@@ -241,20 +261,41 @@ async function main() {
     check('手机带 cookie 打开首页 → 200', phoneHome.status === 200, `HTTP ${phoneHome.status}`);
     check('手机首页是 DSH 前端', phoneHome.body.includes('__DSH_BOOT__'), '首页不含启动清单');
 
+    // ⑦c 长期入口的鉴权边界与重置
+    const wrongKey = await request(Number(lanState.proxyPort), '/mobile-remote/enter?k=wrong', { host: phoneAuthority });
+    check('长期入口密钥错误 → 403（不泄露任何地址）', wrongKey.status === 403, `HTTP ${wrongKey.status}`);
+    const health = await request(Number(lanState.proxyPort), '/mobile-remote/health', { host: phoneAuthority });
+    check('健康检查可达（自有域名模式靠它确认链路）', health.status === 200 && health.body.trim() === 'ok', `HTTP ${health.status}`);
+    const rotated = await request(port, '/mobile-remote/rotate-entry', { method: 'POST', headers: { cookie }, host });
+    const rotatedState = rotated.status === 200 ? JSON.parse(rotated.body) : null;
+    check('重置长期入口 → 密钥换新',
+      rotatedState !== null && rotatedState.entryUrl !== lanState.entryUrl && rotatedState.entryUrl.includes('k='),
+      `HTTP ${rotated.status}`);
+    const staleEntry = await request(Number(lanState.proxyPort), entryPath, { host: phoneAuthority });
+    check('重置后旧二维码立刻失效 → 403', staleEntry.status === 403, `HTTP ${staleEntry.status}`);
+
     // ⑦b 自愈链路（对**真实 DSH** 验，不能只靠假源站）
     //     ① 认证成功那一刻，代理必须补发恢复票；
-    //     ② 带恢复票换票 → 302 回入口地址（手机不用第二次扫码）；
+    //     ② 带恢复票换票 → 302 回当前令牌地址（手机不用第二次扫码）；
     //     ③ 没票只能拿到中转页，且不泄露入口地址；
-    //     ④ 未认证的**文档**经代理 → 401 已换成中转页（真实那句原文必须被替换掉）。
+    //     ④ 未认证的**文档**经代理 → 401 已换成中转页（真实那句原文必须被替换掉）；
+    //     ⑤ 持恢复票的文档 401 → **自动**换票（302），连按钮都不用点。
     const cookies = phoneFirst.headers['set-cookie'] ?? [];
     const bootHeader = cookies.find((c) => c.startsWith('dsh-mobile-boot='));
     check('手机首跳同时拿到恢复票（dsh-mobile-boot）', Boolean(bootHeader), `Set-Cookie=${JSON.stringify(cookies)}`);
     if (bootHeader) {
       const bootCookie = bootHeader.split(';')[0];
       const redeem = await request(port, '/mobile-remote/redeem', { headers: { cookie: bootCookie }, host });
-      check('恢复票换票 → 302 回入口地址',
-        redeem.status === 302 && redeem.headers.location === lanState.authUrl,
+      check('恢复票换票 → 302 回当前令牌地址',
+        redeem.status === 302 && String(redeem.headers.location ?? '').includes('token='),
         `HTTP ${redeem.status} location=${redeem.headers.location}`);
+      const autoRecover = await request(Number(lanState.proxyPort), '/', {
+        host: phoneAuthority,
+        headers: { accept: 'text/html', 'sec-fetch-dest': 'document', cookie: bootCookie },
+      });
+      check('持恢复票的文档 401 → 自动换票（无需点按钮）',
+        autoRecover.status === 302 && autoRecover.headers.location === '/mobile-remote/redeem',
+        `HTTP ${autoRecover.status} location=${autoRecover.headers.location}`);
     }
     const noTicket = await request(port, '/mobile-remote/redeem', { host });
     check('无恢复票 → 只给中转页且不泄露入口地址',
@@ -315,7 +356,7 @@ async function main() {
 
         const pubPng = Buffer.from(publicState.qrPng.slice('data:image/png;base64,'.length), 'base64');
         const pubScanned = decodeMatrix(matrixFromPng(pubPng));
-        check('公网二维码内容 === 公网 authUrl', pubScanned.text === publicState.authUrl, `扫码得到 ${pubScanned.text}`);
+        check('公网二维码内容 === 公网长期入口', pubScanned.text === publicState.entryUrl, `扫码得到 ${pubScanned.text}`);
       }
       await request(port, '/mobile-remote/disable', { method: 'POST', headers: { cookie }, host });
     } else {

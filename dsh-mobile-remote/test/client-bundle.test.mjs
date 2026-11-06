@@ -136,7 +136,7 @@ test('组件渲染：关闭态显示模式选择与开启按钮', () => {
 });
 
 test('组件渲染：开启态显示二维码与链接', () => {
-  // useState 顺序：state, error, busy, mode, ip, copied
+  // useState 顺序：state, error, busy, mode, ip, copied, provider, publicHost, publicPort, autoStart
   const live = {
     phase: 'on',
     enabled: true,
@@ -147,13 +147,20 @@ test('组件渲染：开启态显示二维码与链接', () => {
     targetPort: 19387,
     baseUrl: 'http://192.168.1.5:41234',
     authUrl: 'http://192.168.1.5:41234/?token=SECRET',
+    entryUrl: 'http://192.168.1.5:41234/mobile-remote/enter?k=ENTRYKEY',
+    entryStable: true,
+    autoStart: true,
+    publicProvider: 'quick',
+    publicHost: null,
+    publicPort: null,
+    statePath: 'C:/Users/x/.dsh/mobile-remote/state.json',
     publicUrl: null,
     provider: null,
     qrPng: 'data:image/png;base64,AAAB',
     message: '手机需与电脑在同一 Wi-Fi 下扫码',
     lastError: null,
   };
-  const { exports } = loadBundle([live, null, false, 'lan', '192.168.1.5', false]);
+  const { exports } = loadBundle([live, null, false, 'lan', '192.168.1.5', false, 'quick', '', '', true]);
   const registrations = [];
   exports.apply({
     slots: { inject: (_s, cb) => cb(), register: (d, c) => { registrations.push({ d, c }); return () => {}; } },
@@ -165,7 +172,11 @@ test('组件渲染：开启态显示二维码与链接', () => {
   assert.equal(images[0].props.src, live.qrPng, '二维码应直接使用宿主给的 PNG');
 
   const text = JSON.stringify(tree);
-  assert.ok(text.includes(live.authUrl), '应显示可复制的入口链接');
+  // 二维码旁边显示的必须是**长期入口**，不是那个随重启作废的令牌地址
+  assert.ok(text.includes(live.entryUrl), '应显示可复制的长期入口链接');
+  assert.ok(!text.includes(live.authUrl), '令牌地址不该再出现在界面上（它一重启就失效）');
+  assert.ok(text.includes('重启后仍然有效'), '应说明这条入口跨重启稳定');
+  assert.ok(text.includes('重置长期入口'), '长期入口不随重启轮换，必须给显式作废手段');
   assert.ok(text.includes('已连接'), '应显示已连接状态');
   assert.ok(text.includes('关闭手机连接'), '应提供关闭按钮');
 
@@ -309,9 +320,11 @@ const LAN_RUNNING = {
   proxyPort: 41234, targetPort: 19387,
   baseUrl: 'http://192.168.1.5:41234',
   authUrl: 'http://192.168.1.5:41234/?token=SECRET',
+  entryUrl: 'http://192.168.1.5:41234/mobile-remote/enter?k=ENTRYKEY',
+  entryStable: true, autoStart: true, publicProvider: 'quick', publicHost: null, publicPort: null,
   publicUrl: null, provider: null,
   qrPng: 'data:image/png;base64,AAAB',
-  message: '手机需与电脑在同一 Wi-Fi 下扫码；链接含一次性登录令牌，请勿分享。',
+  message: '手机需与电脑在同一 Wi-Fi 下扫码；链接含登录令牌，请勿分享。',
   lastError: null,
 };
 
