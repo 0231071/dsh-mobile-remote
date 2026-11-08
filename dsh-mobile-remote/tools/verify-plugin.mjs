@@ -204,6 +204,9 @@ async function main() {
     check('插件路由带 cookie → 200', initial.status === 200, `HTTP ${initial.status}：${initial.body.slice(0, 160)}`);
     const initialState = JSON.parse(initial.body);
     check('初始 phase = off', initialState.phase === 'off', `实际 ${initialState.phase}`);
+    // 客户端「已复用上次的公网隧道」那句提示只认这个字段，status 不下发它就成了死代码。
+    check('状态里有 tunnelAdopted 字段', initialState.tunnelAdopted === false,
+      `tunnelAdopted=${initialState.tunnelAdopted}`);
     check('探测到局域网 IP', Array.isArray(initialState.lanIps) && initialState.lanIps.length > 0,
       `lanIps=${JSON.stringify(initialState.lanIps)}`);
     log(`   局域网候选：${initialState.lanIps.join(', ')}`);

@@ -193,6 +193,22 @@ export async function ensureCloudflared(log = () => {}, signal) {
  * @returns {Promise<{ publicUrl: string, pid: number|undefined, logPath: string,
  *   stop: () => Promise<void>, detach: () => void, exited: Promise<number|null> }>}
  */
+/**
+ * 起 cloudflared 的 spawn 选项。**detached 不是可选优化，是隧道能活过宿主的硬前提。**
+ *
+ * 2026-11-08 同机实测（父进程 spawn 后立刻退出，4 秒后看子进程）：
+ *   stdio 管道             → 子进程当场死，日志一行都没写出来
+ *   stdio 文件 + unref()   → 子进程写一行就死
+ *   stdio 文件 + detached  → 子进程活着、日志持续增长
+ *
+ * 少了 detached，detach() 只是"看起来优雅"：cloudflared 随宿主一起死，下次启动
+ * 探测到 HTTP 530，只能重建隧道换域名，旧二维码报废。日志必须是文件而不是管道
+ * （否则 EPIPE），两件事缺一不可。
+ */
+export function quickTunnelSpawnOptions(logFd) {
+  return { stdio: ['ignore', logFd, logFd], windowsHide: true, detached: true };
+}
+
 export async function startQuickTunnel(options) {
   const log = options.log ?? (() => {});
   const signal = options.signal;
@@ -218,10 +234,8 @@ export async function startQuickTunnel(options) {
     logFd = 'ignore';
   }
 
-  const child = spawn(options.binPath, args, {
-    stdio: ['ignore', logFd, logFd],
-    windowsHide: true,
-  });
+  // 选项（含 detached 的理由）见 quickTunnelSpawnOptions()。
+  const child = spawn(options.binPath, args, quickTunnelSpawnOptions(logFd));
   // 父进程这份句柄立刻关掉：子进程已经各自持有，留着只会拖住宿主退出。
   if (typeof logFd === 'number') {
     try {

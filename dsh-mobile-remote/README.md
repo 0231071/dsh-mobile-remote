@@ -129,6 +129,31 @@ git clone https://github.com/0231071/dsh-mobile-remote.git
 所以快速隧道下的准确说法是：**通常不用重扫，但不是保证**。会成为「新码」的情形有：
 上次是你点的关闭、端口被别的程序抢走、cloudflared 已经退出、或者重启间隔太久机器重启过（进程没了）。
 
+#### 「detach」在 Windows 上必须是 `detached: true`（实测，不是理论）
+
+2026-11-08 在同一台机器上做过对照实验：父进程 spawn 一个每 100ms 往 stdout 写日志的子进程，
+父进程立刻退出，4 秒后检查子进程 ——
+
+| spawn 姿势 | 父进程退出后 |
+| --- | --- |
+| `stdio: ['ignore','pipe','pipe']` | **子进程当场死**，日志一行都没写出来 |
+| `stdio: ['ignore', fd, fd]` + `unref()` | **子进程写一行就死** |
+| `stdio: ['ignore', fd, fd]` + `detached: true` | **子进程活着**，日志持续增长 |
+
+只把日志从管道换成文件、再 `unref()`，是**不够**的：Windows 上子进程仍会跟着宿主一起死。
+于是 `detach()` 看起来优雅，实际云梯已经断了 —— 下次启动做身份探测时拿到
+`HTTP 530`（边缘连不上 connector），只能重建隧道换域名，用户看到的就是「重启后又得重扫码」。
+真实事故记录（`activation.log`）：
+
+```
+tunnel detached for next launch: https://gui-elimination-individual-replace.trycloudflare.com (pid=50948, port=53589)
+tunnel not adoptable（健康探测没过：隧道已失效；健康检查 HTTP 530），将重建
+```
+
+两件事必须同时成立：**日志走文件**（否则父进程一退，子进程下次写日志就 EPIPE）+
+**`detached: true`**（否则子进程根本活不下来）。二者由 `quickTunnelSpawnOptions()` 统一给出，
+`test/tunnel-adopt.test.mjs` 里有用例锁住，删掉任何一项测试就红。
+
 ⚠️ 代价：DSH 关着而机器还开着的时候，cloudflared 仍在跑（它指向本机那个端口，端口上没东西就回 502）。
 如果你希望「关掉 DSH 就等于关掉公网」，那就点**「关闭手机连接」**（一定会杀掉它），或者根本别开自动开启。
 万一留下一只僵尸：`Get-Process cloudflared` 能看到，`Stop-Process -Name cloudflared` 清掉即可。
@@ -276,6 +301,7 @@ dsh web authentication required; reopen the URL printed by dsh web.
 | **重启后没有自动开启** | 三种可能，按顺序看：① 「重启后自动开启」没勾上 —— 关过一次也会把它关掉，重新开启时勾上；② 上次开启失败了，`$DSH_HOME/mobile-remote/state.json` 里存的端口被别的程序占走（局域网会自动换随机端口重试；**自有域名模式会直接报错**，因为 Cloudflare 面板指着那个端口）；③ 激活轨迹 `$DSH_HOME/mobile-remote/activation.log` 里有 `auto-start failed:` 一行，原因就在后面。 |
 | **重启后旧二维码打不开** | 先看模式：**局域网 / 自有域名**的入口是稳定的，打不开说明另有原因（见下一行）。**快速隧道**下插件会尝试复用上次那条隧道，复用失败就会出新码 —— 去 `$DSH_HOME/mobile-remote/activation.log` 搜 `tunnel adopted` / `tunnel not adoptable`，后者后面写着原因（端口对不上 / 健康探测没过 / 你上次点的是关闭）。 |
 | 快速隧道没被复用（`tunnel not adoptable`） | 常见三种：① 上次是你点「关闭手机连接」→ 按设计隧道已杀；② 端口被别的程序抢走 → 插件退到随机端口，旧域名接不上；③ 机器重启/cloudflared 自己退了。都会自动重建一条新隧道，扫新码即可。想彻底避免就用 §3.1 的自有域名。 |
+| 刚升级到这个版本，第一次重启还是换了码 | 正常，**从第二次重启起才不变**。上一版是用「管道 stdio、没有 `detached`」起的 cloudflared（见 §3.2 的实验），那只进程本来就会随宿主一起死 —— 插件探测到 `HTTP 530`，只能重建。升级后的新进程才带 `detached: true`，它能熬过下一次退出。 |
 | 自有域名模式一直提示「暂未确认可达」 | 按顺序核：隧道服务在跑吗（`cloudflared service status`）；面板的 Public Hostname 是不是这个域名；**服务地址的端口是否等于插件里填的本地端口**（这个端口会被固定占用）；本机防火墙是否放行该端口。也可以直接 `curl https://<域名>/mobile-remote/health`，它只回 `ok`。 |
 | 自有域名模式直接报「端口监听失败」 | 固定端口被占用了。换个端口，**同时**去 Cloudflare 面板把「服务地址」改成同一个端口（两边必须一致）。 |
 | **用一段时间后，手机整页变成一行字：`dsh web authentication required; reopen the URL printed by dsh web.`** | 手机端那张 DSH 会话 cookie 不在了或没被发送（微信回收网页后重载、清缓存、或从聊天/收藏这类跨站入口回来时 `SameSite=Strict` 不发 cookie）。**正常情况下你看不到这行字**：代理会先自动换票（连按钮都不用点），没有恢复票才给「重新认证」中转页 —— 见 §5。这句话本身是好用的判据：它只由 DSH 的 `BrowserAuth.writeUnauthorized` 产生、且**只作用于 HTML 文档**，所以看到它就说明「DSH 进程和代理都还活着，只是这台手机没票」，不是隧道断了（隧道断了是「无法打开页面」）。 |

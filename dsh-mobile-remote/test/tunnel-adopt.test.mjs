@@ -19,6 +19,7 @@ import {
   adoptTunnel,
   planTunnel,
   probeTunnelIdentity,
+  quickTunnelSpawnOptions,
   reapTunnelProcess,
 } from '../lib/tunnel.js';
 
@@ -143,4 +144,25 @@ test('回收：pid 不存在时安静地返回否；自己的子进程能被真�
   assert.equal(reapTunnelProcess({ pid: child.pid }), true, '活着的应被回收');
   await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 5000))]);
   assert.notEqual(child.exitCode, null, '子进程应真的退出');
+});
+
+/**
+ * 复用能成立的前提是「隧道活得比宿主久」。2026-11-08 同机实测三种 spawn 姿势
+ * （父进程 spawn 后立刻退出，4 秒后检查子进程）：
+ *   stdio 管道             → 子进程当场死，日志一行都没写出来
+ *   stdio 文件 + unref()   → 子进程写一行就死
+ *   stdio 文件 + detached  → 子进程活着，日志持续增长
+ * 少了 detached，detach() 只是看起来优雅：cloudflared 随宿主一起死，下次启动
+ * 探测到 HTTP 530，只能重建隧道换域名 —— 用户看到的就是「重启后又得重扫码」。
+ * 这个用例把结论钉在代码上：谁把 detached 删了，测试就红。
+ */
+test('起 cloudflared 的姿势：日志走文件（避开 EPIPE）+ detached（否则跟着宿主一起死）', () => {
+  const withFd = quickTunnelSpawnOptions(7);
+  assert.equal(withFd.detached, true, 'detached 是隧道活过宿主的硬前提，不能删');
+  assert.deepEqual(withFd.stdio, ['ignore', 7, 7], 'stdout/stderr 必须是文件句柄，不能是管道');
+  assert.equal(withFd.windowsHide, true, '别给用户弹黑窗');
+
+  const fallback = quickTunnelSpawnOptions('ignore');
+  assert.deepEqual(fallback.stdio, ['ignore', 'ignore', 'ignore'], '日志写不了也得能起隧道');
+  assert.equal(fallback.detached, true);
 });

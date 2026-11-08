@@ -170,6 +170,9 @@ test('状态路由：GET /mobile-remote/status 返回 JSON，初始为 off', asy
   assert.equal(state.phase, 'off');
   assert.equal(state.enabled, false);
   assert.ok(Array.isArray(state.lanIps));
+  // 客户端的「已复用上次的公网隧道」那句话读的就是这个字段。它必须在 status 里下发，
+  // 否则那句话永远是死代码 —— 界面就只能含糊地说「长期入口」，讲不出复用成功没有。
+  assert.equal(state.tunnelAdopted, false, 'status 必须下发 tunnelAdopted');
 });
 
 test('鉴权：connection 判定拒绝时不得继续处理（401/403 原样返回）', async () => {
