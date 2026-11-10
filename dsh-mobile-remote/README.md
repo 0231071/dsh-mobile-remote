@@ -154,6 +154,21 @@ tunnel not adoptable（健康探测没过：隧道已失效；健康检查 HTTP 
 **`detached: true`**（否则子进程根本活不下来）。二者由 `quickTunnelSpawnOptions()` 统一给出，
 `test/tunnel-adopt.test.mjs` 里有用例锁住，删掉任何一项测试就红。
 
+#### 真机验证（2026-11-10，Windows，连续两次「托盘退出 → 重开」）
+
+`activation.log` 原文（UTC）：
+
+```
+13:43:17Z  tunnel detached for next launch: https://bands-jump-butter-enters.trycloudflare.com (pid=44932, port=53589)
+13:43:57Z  tunnel not adoptable（健康探测没过：隧道已失效；健康检查 HTTP 530），将重建
+13:45:02Z  teardown → tunnel detached for next launch: https://bands-jump-butter-enters.trycloudflare.com (pid=44932)
+13:45:12Z  tunnel adopted: https://bands-jump-butter-enters.trycloudflare.com port=53589   ← 第二次就复用了
+```
+
+第 1 次之所以还是重建，是因为当时在跑的 cloudflared 是**修复前那版代码**起的（没有 `detached`，必死）；
+它死后重建出的新进程才带 `detached: true`，于是第 2 次退出后它活了下来、端口绑回、健康探测通过 → 复用成功。
+**结论：升级后第一次重启仍会换一次码，从第二次起二维码固定。** 实测该 cloudflared 进程跨两次宿主退出存活。
+
 ⚠️ 代价：DSH 关着而机器还开着的时候，cloudflared 仍在跑（它指向本机那个端口，端口上没东西就回 502）。
 如果你希望「关掉 DSH 就等于关掉公网」，那就点**「关闭手机连接」**（一定会杀掉它），或者根本别开自动开启。
 万一留下一只僵尸：`Get-Process cloudflared` 能看到，`Stop-Process -Name cloudflared` 清掉即可。
