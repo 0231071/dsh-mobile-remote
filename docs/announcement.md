@@ -34,8 +34,8 @@ Concretely: kick off a long task at your desk, walk away, and keep steering **th
 
 | Mode | QR contains | When |
 |---|---|---|
-| **LAN** | `http://<lan-ip>:<port>/?token=…` | phone on the same Wi-Fi — traffic never leaves your network |
-| **Public** | `https://<random>.trycloudflare.com/?token=…` | phone on 4G/5G, anywhere — `cloudflared` quick tunnel, no port forwarding, no VPS |
+| **LAN** | `http://<lan-ip>:<port>/mobile-remote/enter?k=…` | phone on the same Wi-Fi — traffic never leaves your network |
+| **Public** | `https://<random>.trycloudflare.com/mobile-remote/enter?k=…` | phone on 4G/5G, anywhere — `cloudflared` quick tunnel, no port forwarding, no VPS |
 
 > 📷 **配图 ②：换成手机上打开的样子 / replace with a phone screenshot, then continue.**
 
@@ -56,7 +56,7 @@ phone ──► http://<lan-ip>:<port>  (LAN mode)      ──┴─► RewriteP
 
 1. DSH keeps listening on `127.0.0.1` only.
 2. The plugin opens a separate reverse proxy that **rewrites `Host`/`Origin`/`Referer` back to the loopback authority** — that's what makes DSH's own trust check and its authority-bound session cookie work.
-3. Auth is 100% DSH's: the QR carries an official one-time token, and the plugin never sees a key.
+3. Auth is 100% DSH's: the QR carries the plugin's own **long-lived entry key**; when the phone arrives the plugin 302s it to the current process token, and DSH does the checking and sets the cookie. The plugin holds only that entry key and a recovery ticket — neither can forge a DSH cookie.
 
 ### Install (3 steps, one honest warning)
 
@@ -82,7 +82,7 @@ The package README keeps an honest **defect log** — five real bugs, each with 
 
 The tests are written so they can't flatter themselves: the QR encoder is verified by a **separately written decoder** (Reed–Solomon syndromes must be zero, then the PNG is read back into a module matrix), the client bundle is **actually executed** under `node:vm` against the host's ModuleLoader contract, and the narrow-screen CSS is measured in a real Chromium with the very bytes the bundle exports.
 
-`npm test` → **42 passing**, green on Node 20/22 in CI.
+`npm test` → **75 passing**, green on Node 20/22 in CI.
 
 ### Known limits
 
@@ -116,8 +116,8 @@ Thanks for the "everything is a plugin" architecture — this was the first bund
 
 | 模式 | 二维码里是什么 | 什么时候用 |
 |---|---|---|
-| **局域网** | `http://<局域网IP>:<端口>/?token=…` | 手机和电脑同一 Wi-Fi，流量不出本网段 |
-| **公网** | `https://<随机>.trycloudflare.com/?token=…` | 手机在 4G/5G、异地 —— cloudflared 快速隧道，不用端口映射、不用服务器 |
+| **局域网** | `http://<局域网IP>:<端口>/mobile-remote/enter?k=…` | 手机和电脑同一 Wi-Fi，流量不出本网段 |
+| **公网** | `https://<随机>.trycloudflare.com/mobile-remote/enter?k=…` | 手机在 4G/5G、异地 —— cloudflared 快速隧道，不用端口映射、不用服务器 |
 
 > 📷 **配图 ②：换成手机上打开的样子 / replace with a phone screenshot, then continue.**
 
@@ -129,7 +129,8 @@ Thanks for the "everything is a plugin" architecture — this was the first bund
 1. DSH 依旧只听 `127.0.0.1`；
 2. 插件在 `0.0.0.0` 上另开一个**头部改写反向代理**，转发时把 `Host`/`Origin`/`Referer` 改写成回环 authority ——
    这是让 DSH 自己的信任判定与「authority 绑定 cookie」正常工作的关键；
-3. 鉴权 100% 交给 DSH：二维码里装的是官方一次性 token，插件不接触、不保存任何密钥。
+3. 鉴权 100% 交给 DSH：二维码里是插件自己的**长期入口密钥**，手机进来时由插件用当时的进程令牌
+   302 到 `?token=…`，再让 DSH 校验发 cookie；插件只持有入口密钥与恢复票，都伪造不了 DSH 的 cookie。
 
 ### 三步装上（外加一句实话）
 
@@ -164,7 +165,7 @@ git clone https://github.com/0231071/dsh-mobile-remote.git
 再把 PNG 反解回模块矩阵）；浏览器半用 `node:vm` 复刻宿主 ModuleLoader 契约**真跑一遍**；
 窄屏那条 CSS 用真实 Chromium 量布局，注入的字节直接取自 bundle 导出的常量。
 
-`npm test` → **42 项全过**，CI 在 Node 20/22 上是绿的。
+`npm test` → **75 项全过**，CI 在 Node 20/22 上是绿的。
 
 ### 已知限制
 

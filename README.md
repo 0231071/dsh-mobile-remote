@@ -7,7 +7,7 @@
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <a href="https://github.com/0231071/dsh-mobile-remote/actions/workflows/test.yml"><img alt="test" src="https://github.com/0231071/dsh-mobile-remote/actions/workflows/test.yml/badge.svg"></a>
   <img alt="runtime deps" src="https://img.shields.io/badge/runtime%20deps-0-brightgreen.svg">
-  <img alt="tests" src="https://img.shields.io/badge/tests-42-brightgreen.svg">
+  <img alt="tests" src="https://img.shields.io/badge/tests-75-brightgreen.svg">
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20-339933.svg">
   <img alt="dsh" src="https://img.shields.io/badge/DSH-bundle%20plugin-4d6bfe.svg">
 </p>
@@ -26,13 +26,13 @@ than by assertion. Deep-dive docs are in Chinese: [`dsh-mobile-remote/README.md`
 | | |
 |---|---|
 | **痛点** | DSH 跑在桌面上，人一离开电脑就用不了。而把它绑到 `0.0.0.0` 是官方明确拒绝的事 —— 那等于把「可执行任意命令的界面」暴露给整个网络。 |
-| **做法** | DSH **仍然只听 `127.0.0.1`**。插件在 `0.0.0.0` 上另开一个**头部改写反向代理**，转发时把 `Host`/`Origin`/`Referer` 改写成回环 authority；鉴权**完全交给 DSH 自己**（二维码里装的是官方一次性 token，插件不接触任何密钥）。 |
+| **做法** | DSH **仍然只听 `127.0.0.1`**。插件在 `0.0.0.0` 上另开一个**头部改写反向代理**，转发时把 `Host`/`Origin`/`Referer` 改写成回环 authority；鉴权**完全交给 DSH 自己**（二维码里是插件自己的**长期入口密钥**，手机进来时由插件用当时的进程令牌 302 到 `?token=…`，再让 DSH 校验发 cookie；插件只持有入口密钥与恢复票，都伪造不了 DSH 的 cookie）。 |
 | **结果** | 手机扫码即用。同一 Wi-Fi 走局域网直连；在外面用 4G/5G 就走 cloudflared 快速隧道。 |
 
 ```
    手机（浏览器 / 微信）
-        │  扫码打开  http://<局域网IP>:<代理端口>/?token=…
-        │            https://<随机>.trycloudflare.com/?token=…
+        │  扫码打开  http://<局域网IP>:<代理端口>/mobile-remote/enter?k=…
+        │            https://<随机>.trycloudflare.com/mobile-remote/enter?k=…
         ▼
  ┌──────────────────────────────┐
  │  公网模式：cloudflared 隧道    │  quick tunnel，出站 QUIC 到 Cloudflare 边缘
@@ -99,7 +99,7 @@ cd dsh-mobile-remote
 ## 安全说明（请认真读）
 
 - DSH 永远只监听 `127.0.0.1`，本插件**不改变这一点**。
-- 二维码里的链接 = **本机 DSH 的钥匙**（含一次性 token）。别截图发群、别贴到聊天窗口。
+- 二维码里的链接 = **本机 DSH 的长期入口密钥**（`/mobile-remote/enter?k=…`）。别截图发群、别贴到聊天窗口。
 - 公网模式给出的是**免登录临时域名**，任何拿到链接的人都能操作你的电脑：不用时立刻点
   **关闭手机连接**（代理端口释放、隧道进程回收、二维码清空）。
 - cookie 属性为 `HttpOnly; SameSite=Strict`，**不带 `Secure`** —— 这是官方行为，也是局域网
@@ -131,7 +131,7 @@ cd dsh-mobile-remote
 
 ```powershell
 cd dsh-mobile-remote
-npm test                             # 42 项单元/集成：二维码、改写代理、宿主半、浏览器半真实执行
+npm test                             # 75 项单元/集成：二维码、改写代理、宿主半、浏览器半真实执行
 npm run verify                       # 端到端：自己拉起 desktop profile 的 dsh web 跑通全流程
 $env:WITH_PUBLIC="1"; npm run verify # 追加公网隧道那一段
 npm run e2e:lan                      # 对「已在运行的真实 dsh web」跑一次手机令牌登录链路
